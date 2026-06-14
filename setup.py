@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="minion",
-    version="0.1.0",
+    version="0.1.1",
     description="A deliberately tiny coding agent for self-hosted models.",
     py_modules=["minion"],          # tells setuptools to package the single .py file
     python_requires=">=3.9",

@@ -473,6 +473,21 @@ def _env_int(name, default):
     except ValueError:
         return default
 
+
+def _abbr(n):
+    """Compact token count for the stats footer: 832 → '832', 1500 → '1.5K',
+    78825 → '78K', 1234567 → '1.2M'. Keeps the footer tidy once context grows."""
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    if n < 10_000:
+        return f"{n / 1000:.1f}K"
+    if n < 1_000_000:
+        return f"{n // 1000}K"
+    if n < 10_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n // 1_000_000}M"
+
 REASONING_LOOP_SIGNALS = (
     "start coding",
     "let me implement",
@@ -1155,7 +1170,7 @@ def model_turn(messages, reasoning_loop_cut_count=0):
         cache_n = timings.get("cache_n", 0)
         gen_n = timings["predicted_n"]
         tps = timings.get("predicted_per_second", 0)
-        ctx = f"ctx {prompt_n}+{cache_n} cached" if cache_n else f"ctx {prompt_n}"
+        ctx = f"ctx {_abbr(prompt_n)}+{_abbr(cache_n)} cached" if cache_n else f"ctx {_abbr(prompt_n)}"
         prompt_ms = timings.get("prompt_ms", 0)
         ttft = (prompt_ms / 1000.0) if prompt_ms else t_first
         parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
@@ -1172,9 +1187,9 @@ def model_turn(messages, reasoning_loop_cut_count=0):
             cached = getattr(cache_n, "cached_tokens", None)
         tps = gen_n / elapsed if elapsed > 0 else 0
         if cached:
-            ctx = f"ctx {prompt_n}+{cached} cached"
+            ctx = f"ctx {_abbr(prompt_n)}+{_abbr(cached)} cached"
         else:
-            ctx = f"ctx {prompt_n}"
+            ctx = f"ctx {_abbr(prompt_n)}"
         parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
         if t_first:
             parts.append(f"{t_first*1000:4.0f}ms ttft")

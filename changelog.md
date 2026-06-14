@@ -7,6 +7,19 @@ All notable changes to `minion.py` from this point forward.
 > `MINION_*` for clarity. The old env vars are silently ignored — set the new
 > ones.
 
+### Changed — abbreviated token counts in stats footer
+Context and cache token counts in the per-turn stats footer are now
+abbreviated for readability: `832` stays as `832`, `1500` → `1.5K`,
+`78825` → `78K`, `1234567` → `1.2M`. The footer (model-generated token
+counts, prompt context, and cached tokens) is the noisiest line once a
+session grows long — whole-word counts like `78825` are hard to scan at a
+glance.
+
+- New `_abbr(n)` helper. Cutoffs: raw under 1K, one-decimal `X.YK` from
+  1K–10K, whole `NNK` up to 1M, then the same split at millions.
+- Applied in both footer branches: the llama.cpp `timings` path
+  (`ctx P+C cached`) and the standard OpenAI `usage` path.
+
 ### Added — Esc at approval prompts (back to chat)
 The `Y/n` approval prompt for writes/edits/bash now also accepts **Esc**.
 Pressing Esc stops the current turn and drops you back to the chat input so
