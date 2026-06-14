@@ -139,8 +139,17 @@ The risk assessment is shown in brackets next to the prompt, so you have
 context for the decision:
 
 ```
-allow rm -rf /tmp/foo? [risk: HIGH — recursive force delete in /tmp] [Y/n]
+allow rm -rf /tmp/foo? [risk: HIGH — recursive force delete in /tmp] [Y/n/esc]
 ```
+
+At the prompt, press:
+
+- **Y** (or Enter) to approve
+- **n** to deny — the model is told the action was refused and can adapt
+- **Esc** to stop the turn and drop back to the chat input so you can add more
+  guidance. The escaped action is recorded as cancelled; if the model emitted
+  multiple tool calls, any remaining ones are marked skipped so the context
+  stays valid. A note is left so the model knows you pulled it back.
 
 Auto-allowed calls print a one-liner:
 

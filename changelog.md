@@ -7,6 +7,36 @@ All notable changes to `minion.py` from this point forward.
 > `MINION_*` for clarity. The old env vars are silently ignored — set the new
 > ones.
 
+### Added — Esc at approval prompts (back to chat)
+The `Y/n` approval prompt for writes/edits/bash now also accepts **Esc**.
+Pressing Esc stops the current turn and drops you back to the chat input so
+you can add more guidance — useful when the model is about to do something
+slightly off and you'd rather redirect it than approve/deny in isolation.
+
+- New `TURN_ESC` turn status and new `_EscToChat` exception. The exception is
+  a control-flow signal (not a real error): it's raised by `_confirm`, left
+  to propagate through `run_tool`, caught in `model_turn`.
+- New `_ask_approval(prompt)` helper. Reads a single keypress in raw terminal
+  mode (rather than line-based `input()`, which can't detect a bare Esc),
+  disambiguating bare Esc from arrow-key / bracketed-paste escape sequences
+  via a 50ms wait for trailing bytes. Returns `y` / `n` / `esc`, echoes the
+  choice, and falls back to line input (`esc`/`e`/`\x1b` accepted) when
+  stdin isn't a TTY. The prompt now reads `[Y/n/esc]`.
+- `_confirm` raises `_EscToChat(action)` on Esc; Y/n behavior is unchanged.
+- `run_tool` re-raises `_EscToChat` instead of swallowing it as an error
+  string, and closes the cyan tool box with a `(escaped)` marker first.
+- `model_turn` catches `_EscToChat` in both the native tool-call path and the
+  text-fallback path. The escaped call is recorded as `CANCELLED by user
+  (Esc)`; if the assistant emitted multiple tool calls, the remaining ones
+  are marked `SKIPPED` so every `tool_call` still has a matching `tool`
+  result (otherwise the chat template rejects the context on the next
+  request). A synthetic user note is appended and `TURN_ESC` is returned.
+- `main`'s REPL breaks the inner turn loop on `TURN_ESC`, returning to the
+  chat input. The `/compress` approval also honors Esc now.
+- New `tests/test_esc_approval.py` (5 tests): `_confirm` raises on esc,
+  Y/n passthrough, `run_tool` propagation, `model_turn` history-validity on
+  a multi-tool escape, and the REPL loop break.
+
 ### Added — pinned status bar (DECSTBM scroll region)
 A one-line status bar pinned at row 1 of the terminal (model name, source,
 approval mode, endpoint, command hints) using DECSTBM — the same scroll-region

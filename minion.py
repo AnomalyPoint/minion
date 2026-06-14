@@ -573,17 +573,89 @@ def _assess_risk(action):
         return ("high", f"risk call failed: {type(e).__name__}")
 
 
+# A special exception that propagates up from _confirm (via the tool function
+# body → run_tool → model_turn) when the user presses Esc at an approval prompt.
+# It's not a real error — it's a control-flow signal meaning "stop this turn and
+# drop the user back to the chat input so they can add more guidance."
+class _EscToChat(Exception):
+    pass
+
+
 _ACTIVE_SPINNER = None  # set by run_tool() while a tool body is executing
+
+
+def _ask_approval(prompt):
+    """Read a single keypress for a Y/n/esc approval prompt. Returns one of
+    'y', 'n', 'esc'. Esc is accepted both as the bare Esc key (read in raw
+    mode) and as the letter 'e'/'E' for terminals where raw mode isn't
+    usable. Falls back to line-based `input()` when stdin isn't a TTY."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        ans = input(prompt).strip().lower()
+        if ans in ("esc", "e", "\x1b"):
+            return "esc"
+        if ans == "n":
+            return "n"
+        return "y"
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = old[:]
+    new[3] &= ~(termios.ECHO | termios.ICANON)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        c = os.read(fd, 1).decode("utf-8", "replace")
+        if c == "\x1b":
+            # Could be bare Esc OR the lead byte of an escape sequence
+            # (arrow keys, Home/End, bracketed paste, …). Wait briefly; if
+            # no more bytes arrive, it's a bare Esc.
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    os.read(fd, 1)  # swallow the rest of the sequence
+                except OSError:
+                    pass
+                # Any non-bare-Esc sequence (arrow keys etc.) → default proceed.
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "y"
+            sys.stdout.write(f"{DIM}esc{RESET}\n")
+            sys.stdout.flush()
+            return "esc"
+        # Echo the choice for feedback
+        if c in ("\r", "\n"):
+            shown, result = "Y (default)", "y"
+        elif c in ("y", "Y"):
+            shown, result = "Y", "y"
+        elif c in ("n", "N"):
+            shown, result = "n", "n"
+        elif c in ("e", "E"):
+            shown, result = "esc", "esc"
+        else:
+            shown, result = f"{c} → Y (default)", "y"
+        sys.stdout.write(f"{DIM}{shown}{RESET}\n")
+        sys.stdout.flush()
+        return result
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
 
 def _confirm(action):
     """Decide whether to run `action`. Returns True to proceed, False to deny.
+    Raises `_EscToChat` if the user presses Esc — propagating up so the turn
+    stops and the REPL drops back to the chat input.
 
     Flow:
       1. YOLO → True (no call, no prompt).
       2. Ask the model for a risk level (skipped in step 1).
       3. If level ≤ APPROVE_LEVEL → auto-allow (printed as a one-liner).
-      4. Otherwise prompt, showing the level + reason so the user has context.
+      4. Otherwise prompt (Y/n/esc), showing the level + reason so the user
+         has context.
 
     Reads module globals YOLO and APPROVE_LEVEL at call time — /yolo and
     /approval reassign them mid-session, and we must always see the latest
@@ -608,8 +680,12 @@ def _confirm(action):
             return True
         short = reason if len(reason) <= 80 else reason[:77] + "..."
         lvl_color = {"low": DIM, "medium": YELLOW, "high": RED}[level]
-        ans = input(f"{YELLOW}  allow {action}? {lvl_color}[risk: {level.upper()} — {short}]{RESET} {YELLOW}[Y/n] {RESET}").strip().lower()
-        return ans != "n"
+        choice = _ask_approval(
+            f"{YELLOW}  allow {action}? {lvl_color}[risk: {level.upper()} — {short}]{RESET} "
+            f"{YELLOW}[Y/n/esc] {RESET}")
+        if choice == "esc":
+            raise _EscToChat(action)
+        return choice != "n"
     finally:
         if sp is not None:
             sp.start()
@@ -654,6 +730,10 @@ def run_tool(name, args):
     _ACTIVE_SPINNER = spinner
     try:
         result = fn(**args)
+    except _EscToChat:
+        # Close the tool box before propagating so it isn't left visually open.
+        print(f"{CYAN}  └─{RESET} {DIM}(escaped){RESET}")
+        raise  # not an error — control-flow signal back to model_turn/REPL
     except Exception as e:  # noqa: BLE001 — surface any tool error back to the model
         result = f"ERROR: {type(e).__name__}: {e}"
     finally:
@@ -866,6 +946,7 @@ class _ReasoningLoopSignalCounter:
 TURN_DONE = "done"
 TURN_TOOL = "tool"
 TURN_LOOP_CUT = "loop_cut"
+TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
 
 # --- one model turn (streamed), returns TURN_* status -----------------------
@@ -1107,19 +1188,53 @@ def model_turn(messages, reasoning_loop_cut_count=0):
         messages.append({"role": "assistant", "content": text or None, "tool_calls": [
             {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["args"]}}
             for c in ordered]})
-        for c in ordered:
+        esc_action = None
+        for idx, c in enumerate(ordered):
             try:
                 args = json.loads(c["args"] or "{}")
             except json.JSONDecodeError:
                 args = {}
-            messages.append({"role": "tool", "tool_call_id": c["id"],
-                             "content": run_tool(c["name"], args)})
+            try:
+                result = run_tool(c["name"], args)
+            except _EscToChat as e:
+                esc_action = e.args[0] if e.args else c["name"]
+                # Record this call as cancelled, and fill in results for any
+                # remaining tool_calls so the message history stays valid
+                # (every assistant tool_call needs a matching tool result,
+                # or the chat template rejects the context on the next turn).
+                messages.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": "CANCELLED by user (Esc) — returned to chat input"})
+                for c2 in ordered[idx + 1:]:
+                    messages.append({"role": "tool", "tool_call_id": c2["id"],
+                                     "content": "SKIPPED (user pressed Esc at an earlier approval)"})
+                break
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        if esc_action is not None:
+            print(f"{YELLOW}  ↳ escaped approval of {esc_action!r} — back to chat input{RESET}")
+            messages.append({"role": "user", "content":
+                "[User pressed Esc at a tool approval prompt and returned to chat to "
+                "add more input. Acknowledge briefly and wait for their next message.]"})
+            return TURN_ESC
         return TURN_TOOL
 
     calls = parse_text_calls(text)  # text-fallback path
     if calls:
         messages.append({"role": "assistant", "content": text})
-        obs = [f"Observation ({n}): {run_tool(n, a)}" for n, a in calls]
+        obs = []
+        esc_action = None
+        for n, a in calls:
+            try:
+                obs.append(f"Observation ({n}): {run_tool(n, a)}")
+            except _EscToChat as e:
+                esc_action = e.args[0] if e.args else n
+                obs.append(f"Observation ({n}): CANCELLED by user (Esc)")
+                break
+        if esc_action is not None:
+            obs.append("[User pressed Esc at a tool approval prompt and returned to chat "
+                       "to add more input. Acknowledge briefly and wait for their next message.]")
+            print(f"{YELLOW}  ↳ escaped approval of {esc_action!r} — back to chat input{RESET}")
+            messages.append({"role": "user", "content": "\n".join(obs)})
+            return TURN_ESC
         messages.append({"role": "user", "content": "\n".join(obs)})
         return TURN_TOOL
 
@@ -1580,7 +1695,12 @@ def main():
             if body_len <= COMPRESS_KEEP:
                 print(f"{DIM}  nothing to compress ({body_len} turn{'s' if body_len != 1 else ''} in context){RESET}")
                 continue
-            if not _confirm(f"compress {body_len - COMPRESS_KEEP} older turns (keep last {COMPRESS_KEEP})"):
+            try:
+                ok = _confirm(f"compress {body_len - COMPRESS_KEEP} older turns (keep last {COMPRESS_KEEP})")
+            except _EscToChat:
+                print(f"{YELLOW}  ↳ escaped compress approval — back to chat input{RESET}")
+                continue
+            if not ok:
                 print(f"{DIM}  cancelled{RESET}")
                 continue
             print(f"{DIM}  compressing…{RESET}")
@@ -1603,6 +1723,8 @@ def main():
             status = model_turn(messages, reasoning_loop_cuts)
             if status == TURN_DONE:
                 break
+            if status == TURN_ESC:
+                break  # user pressed Esc at an approval → drop to chat input
             steps += 1
             if status == TURN_LOOP_CUT:
                 reasoning_loop_cuts += 1
