@@ -8,7 +8,7 @@ OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang server, or a
 remote API like Z.ai or OpenAI itself — and start chatting with an agent that
 can read, write, edit, and run shell commands in your project.
 
-The whole thing is one file (`minion.py`, ~1500 lines). No TUI framework, no
+The whole thing is one file (`minion.py`, ~2200 lines). No TUI framework, no
 plugin system, no config file format. It reads from environment variables (and
 `~/.env`), talks directly to the OpenAI SDK, and uses raw terminal escapes for
 its interface. If you want to understand or modify how it works, you read one
@@ -85,7 +85,15 @@ across switches (use `/reset` if you want a clean slate).
 | `--yolo`                      | start in never-prompt mode (auto-approve everything)      |
 | `--approval <low\|medium\|high>` | start with a non-default approval threshold            |
 | `--source <name>`             | start on a specific source                                |
-| `--no-scroll-bottom`          | disable the pinned status bar / scroll-region setup       |
+| `--resume [target]`           | resume a saved session; bare = most recent                |
+| `--session <id>`              | start a fresh run attached to a specific session id       |
+
+## Subcommands
+
+| subcommand          | what it does                                          |
+| ------------------- | ---------------------------------------------------- |
+| `minion`            | start the REPL                                        |
+| `minion sessions [query]` | list saved sessions (prints + exits); optional substring filter |
 
 ## Commands
 
@@ -94,9 +102,13 @@ across switches (use `/reset` if you want a clean slate).
 | `/source [name]`    | list sources or switch to one (context preserved)       |
 | `/yolo`             | toggle auto-approve for writes and bash                 |
 | `/approval [level]` | show or set risk threshold (`low`/`medium`/`high`/`yolo`) |
+| `/sessions [n]`     | list recent sessions, or show one in full               |
+| `/resume [target]`  | resume a past session (`n`/id/prefix/title)             |
+| `/save [title]`     | save the current session (optional custom title)        |
+| `/delete [target]`  | delete a saved session                                  |
 | `/compress`         | summarize older turns into one, keep last 2 verbatim     |
 | `/compact`          | alias for `/compress`                                    |
-| `/reset`            | clear conversation, keep system prompt                   |
+| `/reset`            | clear conversation, start a fresh session               |
 | `/quit`             | exit                                                     |
 
 ## Input
@@ -161,6 +173,55 @@ YOLO mode skips the classifier entirely. If the classifier call fails or returns
 garbage, the action defaults to `high` (always prompts) so it errs on the side
 of asking.
 
+## Sessions (save / resume)
+
+Every chat is automatically saved to `~/.minion/sessions/` (override with
+`MINION_HOME` or `MINION_SESSIONS_DIR`) — one JSON file per session holding
+the exact message array the model sees plus a little metadata (id, title,
+description, source, cwd, timestamps). Files are plain JSON and
+human-readable/greppable.
+
+- **Auto-save** happens after every model turn, so a crash or accidental close
+  never loses your work. On Ctrl-D / Ctrl-C exit a grey
+  `resume with: minion --resume <id>` hint is printed so you can pick right
+  back up.
+- The **title** is auto-derived from your first message; set a custom one with
+  `/save <title>`.
+- A **short id** (the 6-hex suffix) is shown in listings and accepted by
+  `--resume` / `/resume`, so `minion --resume deadbe` works without typing the
+  full timestamp.
+- A **model-generated description** refreshes every `MINION_SESSION_DESC_REFRESH`
+  turns (default **6**; `0` disables) and appears as a dim subtitle under each
+  session in `minion sessions` / `/sessions` — it tracks the current task
+  rather than freezing on the first message.
+- **Resume** a session at startup with `minion --resume <target>` or mid-chat
+  with `/resume <target>`. A `target` is a number from `/sessions`, a short id,
+  a full session id, a unique id prefix, or an exact title. Bare
+  `minion --resume` resumes your most recent session.
+- On resume, the **full conversation history is printed** as a one-line-per-
+  message recap (color-coded by role, tool calls shown as `→ name(...)`) so
+  you immediately re-orient on what the chat was about.
+- **Discover** saved sessions from the shell with `minion sessions` (prints
+  and exits — no REPL). Add a substring query to filter:
+  `minion sessions refactor` matches titles, descriptions, and ids.
+- A resumed session **reselects the source** (endpoint + model) it was started
+  on, so it lands on the same backend it was talking to.
+- `/sessions <n>` shows the full transcript of a past session inline.
+- `/reset` starts a fresh session (it does not overwrite the old one).
+
+```
+$ minion sessions              # browse recent sessions, then exit
+$ minion sessions refactor     # filter to sessions mentioning "refactor"
+$ minion --resume 1            # resume the most recent session
+$ minion --resume deadbe       # resume by short id
+$ minion --resume implement    # resume the session titled "implement…"
+```
+
+This is a deliberately lightweight take on session persistence — inspired by
+how Hermes (`hermes_state.py`) stores sessions, but flat JSON files instead of
+SQLite, since minion is a single local agent rather than a multi-platform
+gateway.
+
 ## Reasoning-loop guard
 
 Reasoning models sometimes spin in place — they keep saying "let me implement…"
@@ -182,16 +243,16 @@ cut.
 
 ## Status bar
 
-When running in a terminal, minion pins a one-line status bar at the top of the
-screen (model name, source, approval mode, endpoint, available commands) using a
-DECSTBM scroll region — the same primitive tmux and vim use for their status
-lines. The chat output scrolls in the region below it. Pass
-`--no-scroll-bottom` to disable.
+At startup (and after a `/source` / `/yolo` / `/approval` switch) minion
+prints a one-line banner showing the model name, active source, approval
+mode, and endpoint. The banner is printed into the normal scrollback —
+there's no pinned/scroll-region status bar, so terminal scrollback works
+normally and every line of output stays visible.
 
-> **Note:** The pinned status bar relies on terminal scroll-region support.
-> This works in most terminals (and under tmux), but some multiplexers like
-> Zellij don't fully implement it — in those, the bar may scroll away after
-> enough output. Not a bug in minion; just a terminal-emulation gap.
+(An earlier version pinned a status bar at row 1 using a DECSTBM scroll
+region, like tmux/vim. It was removed because it broke terminal scrollback —
+lines scrolling off the top of the region never entered the scrollback
+buffer, so the chat became unscrollable in a plain terminal.)
 
 ## Log
 

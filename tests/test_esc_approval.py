@@ -183,8 +183,9 @@ def test_model_turn_native_esc():
 def test_repl_breaks_on_esc():
     saved_read_multiline = m.read_multiline
     saved_model_turn = m.model_turn
-    saved_setup = m._setup_status_bar
-    m._setup_status_bar = lambda: False
+    saved_banner = m._banner
+    saved_paint = m._paint_status_bar
+    m._banner = lambda: ""
     m._paint_status_bar = lambda: None
     m.LifeSpinner = type("NoSpinner", (), {
         "__init__": lambda self, **kw: None,
@@ -214,7 +215,8 @@ def test_repl_breaks_on_esc():
     finally:
         m.read_multiline = saved_read_multiline
         m.model_turn = saved_model_turn
-        m._setup_status_bar = saved_setup
+        m._banner = saved_banner
+        m._paint_status_bar = saved_paint
         builtins.print = _REAL_PRINT
     print("PASS — REPL breaks inner loop on TURN_ESC, no extra model turn")
 

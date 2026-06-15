@@ -7,7 +7,7 @@ build/
 dist/
 
 # generated at runtime by minion.py
-llamacpp.log
+logs/
 
 # old backups
 bkup/

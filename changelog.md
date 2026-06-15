@@ -7,6 +7,145 @@ All notable changes to `minion.py` from this point forward.
 > `MINION_*` for clarity. The old env vars are silently ignored — set the new
 > ones.
 
+### Added — transcript shown on resume
+Resuming a session (`--resume` at startup, or `/resume` mid-chat) now prints
+the full conversation history as a one-line-per-message recap before the
+first prompt, so you immediately re-orient on what the chat was about.
+
+- New `_print_transcript(messages, max_chars=120)` helper — collapses each
+  message to a single line (newlines → spaces, truncated to ~120 chars),
+  color-codes by role (cyan user / green assistant / dim tool), renders
+  assistant tool-call turns as `→ name(...)` so you can see what ran, and
+  skips system messages.
+- Called from `main()`'s `--resume` startup path (after the "↻ resumed …"
+  header, framed by `── transcript ──` / `──────────────` dividers) so the
+  user sees the whole conversation before typing.
+- `/sessions <id>` detail view refactored to use the same helper (was a
+  near-duplicate of the same render loop; now shares one code path).
+
+### Added — short ids + model-generated descriptions in session listings
+Session listings (`minion sessions`, `/sessions`, bare `/resume`) now show
+two things they didn't before: a scannable **short id** and a
+**model-generated description** that evolves as the conversation progresses.
+
+- `_short_id(id)` returns the 6-hex suffix of an id (`YYYYMMDD-HHMMSS-XXXXXX`
+  → `XXXXXX`) since the date+time prefix is shared/redundant across sessions
+  created in the same minute. Shown in magenta in every listing.
+- `_resolve_session` now matches on that short id (the tail segment) in
+  addition to full id / prefix / index / title — so `minion --resume deadbe`
+  works.
+- `_maybe_refresh_description(id, messages)` makes one cheap non-streaming
+  call every `SESSION_DESC_REFRESH` (default **6**, override with
+  `MINION_SESSION_DESC_REFRESH`; `0` disables) user turns, asking the model
+  for a ≤70-char one-liner about what the session is working on. Stored in
+  the session file's `description` field alongside a `desc_turns` counter so
+  the next refresh is scheduled correctly. Surfaced as a dim subtitle line
+  under each listing entry; falls back to the first-message preview when no
+  description exists yet. Failures (server down, empty reply) leave the
+  existing description untouched.
+- New `DESC_SYSTEM` prompt and `_DESC_REFRESH_DEFAULT` sentinel (resolved
+  lazily to `SESSION_DESC_REFRESH` after `_env_int()` is defined, since the
+  sessions section sits above `_env_int` in the file).
+- Listings updated in all three spots: `_cli_sessions` (the `minion sessions`
+  subcommand), `_cmd_sessions` (the in-session `/sessions`), and the bare
+  `/resume` picker — all show `index  short-id  title · N msg · when · source`
+  with the description (or preview fallback) on a second dim line.
+
+### Added — Ctrl+C exit shows a grey resume hint
+On Ctrl-D / Ctrl-C exit, after flushing the session, minion now prints
+`resume with: minion --resume <full-id>` in grey — so you can copy-paste
+straight back into the session you just left without running `minion sessions`
+first.
+
+### Fixed — plain `minion` run never saved its session
+A plain `minion` invocation (no `--resume`/`--session` flag) never minted a
+session id: `_session_id_from_args()` returned `None` and nothing filled it
+in, so `_save_current()`'s `if session_id is None: return` guard silently
+discarded every turn. Every plain-`minion` session was lost. Fixed by minting
+a fresh id immediately when no resume/session flag is present; also untangled
+the `_resume_requested` logic so session-loading only happens when the user
+explicitly asked to resume (a fresh run no longer pointlessly tries to load
+a non-existent file for its newly-minted id).
+
+### Fixed — docs reflected removed DECSTBM status-bar feature
+The README and module docstring still described the pinned scroll-region
+status bar (`--no-scroll-bottom`, DECSTBM) as if it were current, but the
+working tree had already moved to a plain banner printed into scrollback
+(the scroll-region bar was removed because it broke terminal scrollback).
+- README **Status bar** section rewritten to describe the current banner
+  behavior and note the removed scroll-region approach as history.
+- Defunct `--no-scroll-bottom` flag dropped from the README flags table and
+  the module docstring's flags line (it was already not parsed by the code).
+- Intro line-count claim updated from `~1500` to `~2200` to match reality.
+
+### Added — chat sessions (save / resume)
+
+Every chat is now automatically saved and resumable. Sessions are stored as
+plain JSON files under `~/.minion/sessions/` (override with `MINION_HOME` or
+`MINION_SESSIONS_DIR`), one file per session, holding the exact `messages`
+array the model sees plus light metadata (id, title, source, cwd, timestamps).
+Greppable, human-readable, and trivially round-trippable. A deliberately
+lightweight take on session persistence — inspired by how Hermes
+(`hermes_state.py`) stores sessions, but flat JSON files instead of SQLite,
+since minion is a single local agent rather than a multi-platform gateway.
+
+**Persistence layer** (new section in `minion.py`):
+- `_write_session(id, messages, meta)` — atomic write (temp file + rename)
+  so a crash mid-write can't corrupt an existing session. Merges metadata
+  into the stored file, preserving `created_at` / `source` / `title` across
+  re-writes.
+- `_load_session(id)` — read a session dict or `None`.
+- `_list_sessions(limit)` — newest-first list with auto-derived title (from
+  the first user message), first-message preview, message count, source.
+- `_delete_session(id)` — idempotent file removal.
+- `_resolve_session(target, sessions)` — resolve a user-typed target to an
+  id via number, exact id, unique prefix, or exact title.
+- `_new_session_id()` — timestamp + 6 hex chars (`YYYYMMDD-HHMMSS-XXXXXX`).
+- New `import secrets`.
+
+**Auto-save**: the REPL saves the in-memory `messages` to the session file
+after every model turn (and on Ctrl-D / `/quit` exit), so a crash or
+accidental close never loses work. A session that never receives a user
+message is never written to disk. Mirrors Hermes's per-turn flush pattern.
+
+**New in-session commands**:
+- `/sessions [n]` — bare lists recent sessions with index, title, msg count,
+  relative time, source badge, and a dim preview line. With an index/id/title
+  it prints the full transcript of one session inline.
+- `/resume [target]` — switch to a past session mid-chat. Bare shows the
+  recent list; with a target (`n`/id/prefix/title) it loads it. Resuming
+  reselects the recorded **source** (endpoint + model) so the chat lands on
+  the same backend it was talking to.
+- `/save [title]` — persist now (otherwise it's automatic); optional
+  explicit title overrides the auto-derived one.
+- `/delete [target]` — remove a saved session file (refuses the current one).
+
+**New CLI flags / subcommand**:
+- `--resume [target]` — resume a session at startup. Bare = most recent
+  (the "I closed my laptop" case); with a target it resolves by
+  index/id/prefix/title. The parser checks whether the next arg starts with
+  `-`, so `minion --resume --yolo` doesn't swallow `--yolo` as the target.
+  If there are no saved sessions, it degrades to a fresh start with an
+  informative message instead of an error.
+- `--session <id>` — start a fresh run pinned to a specific session id.
+- `minion sessions [query]` — **subcommand** that prints recent sessions
+  and exits (no REPL). Optional substring query filters across title,
+  first-message preview, and id, so once the list grows you can narrow with
+  e.g. `minion sessions refactor`. Deliberately a separate verb from
+  `--resume` (discover vs. enter) rather than `--resume list`, since "list"
+  looks like it could be a session title and a flag whose meaning flips on a
+  magic word is a footgun.
+
+**`/reset` now forks a new session id** (mirrors Hermes's "new session on
+/new") instead of clobbering the current one in place — so resetting never
+overwrites the conversation you were just in.
+
+**Tests**: new `tests/test_sessions.py` (11 tests) covering write→load
+round-trip, atomic merge, missing-file handling, newest-first ordering,
+resolve-by-index/id/prefix/title, delete idempotency, unique ids, title
+sanitization, bare-`--resume`-picks-most-recent, the `--resume`-vs-next-flag
+guard, and the `sessions` list/filter subcommand.
+
 ### Changed — abbreviated token counts in stats footer
 Context and cache token counts in the per-turn stats footer are now
 abbreviated for readability: `832` stays as `832`, `1500` → `1.5K`,

@@ -23,13 +23,24 @@ Multiple sources — define named endpoints and switch between them at runtime:
 
   python minion.py --source zai                     # start on Z.ai
 
-Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /quit
-Flags: --yolo  --approval <low|medium|high>  --source <name>  --no-scroll-bottom
+Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
+
+  python minion.py sessions           # list saved sessions (prints + exits)
+  python minion.py sessions refactor  # …filtered by a substring query
+  python minion.py --resume <id|short-id|prefix|title>  # resume a past session
+  python minion.py --resume 1                        # resume the most recent
+  /sessions                       # list recent sessions (with short ids)
+  /resume <n|short-id|title>      # switch to another session mid-chat
+  /save [title]                   # save the current session (title optional)
+
+Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /sessions  /resume  /save  /delete  /quit
+Flags: --yolo  --approval <low|medium|high>  --source <name>  --resume <target>  --session <id>
 """
 import json
 import os
 import random
 import re
+import secrets
 import select
 import shutil
 import subprocess
@@ -69,6 +80,302 @@ def _load_env_file():
 
 
 _load_env_file()
+
+
+# --- sessions ---------------------------------------------------------------
+# Chat history persistence. Each session is one JSON file under
+# ~/.minion/sessions/ (override with MINION_HOME / MINION_SESSIONS_DIR).
+# The file stores the exact `messages` array the model sees (system prompt
+# + every turn + tool calls/results), plus a little metadata (id, title,
+# created_at, updated_at, cwd, source). Greppable, human-readable, and it
+# round-trips trivially — load it back in and you have a resumable chat.
+#
+# Design cribbed from Hermes (hermes_state.py / SessionDB), which uses a
+# SQLite store + FTS5 search because it's a multi-platform gateway (web,
+# CLI, Telegram, …) with billing and compression chains. minion is a single
+# local agent, so a flat directory of JSON files gives the same UX
+# (auto-save per turn, /sessions, /resume, /save) without the weight.
+
+SESSION_HOME = os.path.expanduser(
+    os.environ.get("MINION_HOME", "~/.minion")
+)
+
+
+def _sessions_dir():
+    """Where session files live. Honors MINION_SESSIONS_DIR, then MINION_HOME/sessions."""
+    return os.path.expanduser(
+        os.environ.get("MINION_SESSIONS_DIR",
+                       os.path.join(SESSION_HOME, "sessions"))
+    )
+
+
+def _new_session_id():
+    """Short, unguessable, sortable-ish: YYYYMMDD-HHMMSS-<6 hex>."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{secrets.token_hex(3)}"
+
+
+def _safe_title(text, maxlen=60):
+    """Turn the first user message into a filesystem-safe-ish title.
+
+    Collapses whitespace, strips control chars, clamps length. We don't
+    scrub for path-separators beyond replacing them with spaces — the id
+    (not the title) is the filename, so a weird title can't break lookup.
+    """
+    if not text:
+        return None
+    text = " ".join(str(text).split())
+    text = "".join(c for c in text if c.isprintable())
+    if len(text) > maxlen:
+        text = text[:maxlen - 1] + "…"
+    return text or None
+
+
+def _session_path(session_id):
+    return os.path.join(_sessions_dir(), f"{session_id}.json")
+
+
+def _write_session(session_id, messages, meta=None):
+    """Persist `messages` to the session file. Creates the dir if needed.
+
+    Writes atomically (temp file + rename) so a crash mid-write can't
+    corrupt the existing session. `meta` (title, source, cwd, …) is
+    merged into the stored metadata.
+    """
+    d = _sessions_dir()
+    os.makedirs(d, exist_ok=True)
+    path = _session_path(session_id)
+    now = time.time()
+    existing = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+        if not isinstance(existing, dict):
+            existing = {}
+    except (OSError, IOError, json.JSONDecodeError):
+        pass
+    data = {
+        "id": session_id,
+        "messages": messages,
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+    }
+    for k in ("title", "source", "cwd", "model"):
+        if k in existing:
+            data[k] = existing[k]
+    if meta:
+        for k, v in meta.items():
+            if v is not None:
+                data[k] = v
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _load_session(session_id):
+    """Read a session file. Returns the dict (id, messages, meta…) or None."""
+    path = _session_path(session_id)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "messages" in data:
+            return data
+    except (OSError, IOError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _list_sessions(limit=20):
+    """Return sessions newest-first as dicts: id, title, description, preview, n.
+
+    `preview` is the first ~60 chars of the first user message; `description`
+    is an optional model-generated one-liner refreshed every N turns (richer
+    than the static first-message title). `n` is the turn count (non-system
+    messages)."""
+    d = _sessions_dir()
+    try:
+        files = [f for f in os.listdir(d) if f.endswith(".json")]
+    except OSError:
+        return []
+    out = []
+    for fname in files:
+        path = os.path.join(d, fname)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "messages" not in data:
+                continue
+        except (OSError, IOError, json.JSONDecodeError):
+            continue
+        sid = data.get("id") or fname[:-5]
+        msgs = data.get("messages", [])
+        preview = ""
+        for m in msgs:
+            if m.get("role") == "user" and m.get("content"):
+                preview = _safe_title(m["content"]) or ""
+                break
+        out.append({
+            "id": sid,
+            "short": _short_id(sid),
+            "title": data.get("title") or preview or "(empty)",
+            "description": data.get("description"),
+            "preview": preview,
+            "updated_at": data.get("updated_at", 0),
+            "n": len([m for m in msgs if m.get("role") != "system"]),
+            "model": data.get("model"),
+            "source": data.get("source"),
+        })
+    out.sort(key=lambda s: s["updated_at"], reverse=True)
+    return out[:limit]
+
+
+def _delete_session(session_id):
+    """Remove a session file. Returns True if something was deleted."""
+    path = _session_path(session_id)
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+# After this many user turns, minion asks the model for a short (≤70 char)
+# description of the whole conversation so far and stores it in the session
+# file's `description` field. The description refreshes on every Nth turn
+# thereafter, so it tracks what the chat is actually about as it evolves —
+# far more useful in `minion sessions` than a static first-message title.
+# 0 disables the refresh entirely (the auto-derived title is used as-is).
+# The actual value is resolved after _env_int() is defined (below), so this
+# is just a sentinel; see SESSION_DESC_REFRESH.
+_DESC_REFRESH_DEFAULT = 6
+
+
+def _short_id(session_id):
+    """The scannable tail of a session id (the 6-hex suffix), for listings.
+
+    The full id is `YYYYMMDD-HHMMSS-XXXXXX`; in a list of recent sessions the
+    date+time prefix is shared/redundant, so we show just the 6 hex chars as a
+    quick tag the user can grep or pass to --resume."""
+    if session_id and "-" in session_id:
+        return session_id.rsplit("-", 1)[-1]
+    return session_id or ""
+
+
+def _maybe_refresh_description(session_id, messages):
+    """Ask the model for a one-line session description, if enough turns have
+    passed since the last refresh.
+
+    Refreshes at the configured interval (every SESSION_DESC_REFRESH user
+    turns). The description is stored in the session file's `description`
+    field and surfaced in `minion sessions` / `/sessions` listings. A failure
+    (server down, empty response) leaves the existing description untouched.
+
+    Returns the new description string, or None if no refresh happened.
+    """
+    if SESSION_DESC_REFRESH <= 0:
+        return None
+    # Count user turns (exclude synthetic runtime-note-only turns).
+    user_turns = sum(
+        1 for m in messages
+        if m.get("role") == "user"
+        and isinstance(m.get("content"), str)
+        and not m["content"].lstrip().startswith("[")
+    )
+    existing = _load_session(session_id) or {}
+    last_desc_turns = existing.get("desc_turns", 0)
+    # Refresh when we've crossed a multiple of SESSION_DESC_REFRESH since the
+    # last recorded refresh. Don't refresh before the first threshold (so a
+    # 1-turn "hello" session doesn't burn a model call).
+    if user_turns < SESSION_DESC_REFRESH:
+        return None
+    if user_turns - last_desc_turns < SESSION_DESC_REFRESH:
+        return None
+    # Build a compact transcript for the summarizer — truncate tool outputs
+    # and skip the system prompt to keep the call cheap.
+    def _trim(msgs, per_msg=500, cap=20):
+        out = []
+        for m in msgs:
+            if m.get("role") == "system":
+                continue
+            c = m.get("content")
+            if c is None and m.get("tool_calls"):
+                calls = ", ".join(
+                    f"{tc['function']['name']}(...)" for tc in m["tool_calls"])
+                c = f"→ {calls}"
+            elif isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            c = (c or "").replace("\n", " ").strip()
+            if len(c) > per_msg:
+                c = c[:per_msg - 1] + "…"
+            out.append(f"[{m.get('role', '?')}] {c}")
+            if len(out) >= cap:
+                break
+        return "\n".join(out)
+    prompt = _trim(messages[-30:])  # last ~30 messages is plenty of context
+    payload = [
+        {"role": "system", "content": DESC_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        _log_event("req", {"model": MODEL, "messages": payload,
+                           "stream": False, "_purpose": "session_desc"})
+        resp = client.chat.completions.create(
+            model=MODEL, messages=payload, stream=False, timeout=20)
+        try:
+            _log_event("resp", {"_purpose": "session_desc", "data": resp.model_dump()})
+        except Exception:
+            pass
+    except APIConnectionError:
+        return None  # server down — leave existing description as-is
+    except Exception:
+        return None
+    desc = (resp.choices[0].message.content or "").strip().splitlines()
+    desc = desc[0].strip() if desc else ""
+    if not desc:
+        return None
+    desc = _safe_title(desc, maxlen=70) or desc[:70]
+    # Persist the description + the turn count it was generated at so we know
+    # when to refresh next. Merge into existing meta (don't clobber messages).
+    _write_session(session_id, messages, {"description": desc,
+                                          "desc_turns": user_turns})
+    return desc
+
+
+def _resolve_session(target, sessions=None):
+    """Resolve a user-typed target to a session id.
+
+    Accepts: a full id, a numeric index into the recent-sessions list,
+    a unique id prefix, or an exact title. Returns the id or None.
+    """
+    if not target:
+        return None
+    target = target.strip()
+    sessions = sessions if sessions is not None else _list_sessions(limit=50)
+    ids = [s["id"] for s in sessions]
+    # numeric index → recent-sessions slot
+    if target.isdigit():
+        idx = int(target)
+        if 1 <= idx <= len(sessions):
+            return sessions[idx - 1]["id"]
+    # exact id
+    if target in ids:
+        return target
+    # unique prefix
+    prefixed = [i for i in ids if i.startswith(target)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    # short id (the 6-hex suffix shown in listings) — match the tail segment
+    # since the date+time prefix is shared/redundant across sessions created
+    # in the same minute.
+    suffixed = [i for i in ids if i.endswith("-" + target) or _short_id(i) == target]
+    if len(suffixed) == 1:
+        return suffixed[0]
+    # exact title
+    titled = [s["id"] for s in sessions if s["title"] == target]
+    if len(titled) == 1:
+        return titled[0]
+    return None
 
 
 # --- model sources ----------------------------------------------------------
@@ -230,7 +537,8 @@ if YOLO:
 # --- base-level traffic log -------------------------------------------------
 # Append-only JSONL record of every byte we ship to / receive from the server.
 # Lives next to this script so it's easy to find; rotate by hand if it gets big.
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llamacpp.log")
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "llamacpp.log")
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 _llog = open(LOG_PATH, "a", buffering=1)  # line-buffered; flushes per write
 
 
@@ -500,6 +808,16 @@ REASONING_LOOP_SIGNALS = (
     "start with the code",
 )
 REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
+# Resolved here (not at the sessions-section top) because _env_int() is
+# defined just above. See the comment at _DESC_REFRESH_DEFAULT for behavior.
+SESSION_DESC_REFRESH = _env_int("MINION_SESSION_DESC_REFRESH", _DESC_REFRESH_DEFAULT)
+DESC_SYSTEM = (
+    "You summarize coding-agent conversations into one short line. "
+    "Given the transcript, reply with ONLY a single line of at most 70 "
+    "characters describing what this session is about / working on — the "
+    "current task, key files, or goal. No preamble, no quotes, no trailing "
+    "punctuation. Write in the same language as the conversation."
+)
 REASONING_LOOP_NUDGES = (
     "You are looping in reasoning after repeatedly deciding to start implementation. "
     "Stop planning now. Take the next concrete action: either call the appropriate tool "
@@ -1527,35 +1845,15 @@ def read_multiline(initial="", history=None):
 
 
 # --- repl -------------------------------------------------------------------
-# The descriptor (URL, commands, log path) used to live here in the banner.
-# Now that the status bar at row 1 carries it permanently, the banner is
-# just a one-line welcome at the bottom of the scroll region — model name
-# only, since everything else is already pinned at the top.
 def _banner():
-    """One-line welcome shown after the status bar is set up. Rebuilt on
-    each call so it reflects the current source after a /source switch."""
-    src_tag = f" {DIM}·{RESET} {MAGENTA}{ACTIVE.name}{RESET}" if len(SOURCES) > 1 else ""
-    return f"{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}{src_tag}"
-
-
-_STATUS_BAR_ACTIVE = False
-
-
-def _build_status_bar(cols):
-    """Compose the status-bar string for the given terminal width. Builds
-    left-to-right, dropping less-important pieces (log path, URL, commands)
-    when the terminal is too narrow. Adds the source name in magenta when
-    more than one source is configured."""
-    sep = f" {DIM}·{RESET} "
-    def _vis(s):
-        return len(re.sub(r'\033\[[0-9;]*m', '', s))
-
+    """Multi-line banner shown at startup / after a /source switch. Carries
+    the status info (model, source, approval level, endpoint) that used to
+    live in the pinned status bar — now in the banner because a DECSTBM
+    scroll region breaks terminal scrollback."""
+    sep = f"{DIM} · {RESET}"
     parts = [f"{BOLD}minion{RESET}", f"{CYAN}{MODEL}{RESET}"]
     if len(SOURCES) > 1:
         parts.append(f"{MAGENTA}{ACTIVE.name}{RESET}")
-    # Show the approval mode so it's always visible at a glance. Green when
-    # nothing will prompt (high / yolo), yellow when medium, dim for the
-    # default low.
     if YOLO or APPROVE_LEVEL is None:
         parts.append(f"{GREEN}yolo{RESET}")
     elif APPROVE_LEVEL == "high":
@@ -1564,86 +1862,130 @@ def _build_status_bar(cols):
         parts.append(f"{YELLOW}auto:medium{RESET}")
     else:
         parts.append(f"{DIM}auto:low{RESET}")
-    used = sum(_vis(p) for p in parts) + _vis(sep) * (len(parts) - 1)
-    for piece in (str(client.base_url),
-                  "/source /yolo /approval /compress /compact /reset /quit",
-                  "log → llamacpp.log"):
-        extra = _vis(sep) + _vis(piece)
-        if used + extra <= cols - 2:
-            parts.append(piece)
-            used += extra
-        else:
-            break
+    parts.append(f"{DIM}{client.base_url}{RESET}")
     return sep.join(parts)
 
 
-def _setup_status_bar():
-    """Pin a one-line status bar at the top of the terminal and confine the
-    rest of the session to a scroll region below it (DECSTBM, same primitive
-    tmux / vim / less use for their status lines). Returns True if installed;
-    False if skipped (non-TTY, terminal too short, or --no-scroll-bottom).
-    Sets _STATUS_BAR_ACTIVE so _paint_status_bar knows it can repaint."""
-    global _STATUS_BAR_ACTIVE
-    if not sys.stdout.isatty() or "--no-scroll-bottom" in sys.argv:
-        return False
-    rows, cols = shutil.get_terminal_size((80, 24))
-    if rows < 5:
-        return False
-
-    status = _build_status_bar(cols)
-    sys.stdout.write(f"\033[2;{rows}r")
-    sys.stdout.write(f"\033[1;1H\033[2K{status}")
-    # Wipe the scroll region so stale terminal content (previous shell
-    # output, a prior minion session, etc.) doesn't linger below the bar.
-    # \033[J erases from the cursor (now at row 2) to the end of the display,
-    # which is exactly rows 2..rows — the scroll region we just set. Row 1
-    # (the freshly-painted status bar) is untouched since the cursor starts
-    # the erase at row 2.
-    sys.stdout.write(f"\033[2;1H\033[J")
-    sys.stdout.write(f"\033[{rows};1H")
-    sys.stdout.flush()
-    _STATUS_BAR_ACTIVE = True
-    return True
-
-
 def _paint_status_bar():
-    """Repaint row 1 after a /source switch. No-op if the bar was never
-    installed. Returns cursor to the bottom of the scroll region."""
-    if not _STATUS_BAR_ACTIVE:
-        return
-    sz = shutil.get_terminal_size((80, 24))
-    status = _build_status_bar(sz.columns)
-    sys.stdout.write(f"\033[1;1H\033[2K{status}")
-    sys.stdout.write(f"\033[{sz.lines};1H")
-    sys.stdout.flush()
+    """Reprint the banner (model/source/approval/endpoint) after a /source,
+    /yolo, or /approval switch. Previously repainted a pinned status bar at
+    row 1; now just prints the banner since the scroll-region status bar was
+    removed (it broke terminal scrollback)."""
+    print(_banner())
 
 
 def main():
     global YOLO, APPROVE_LEVEL
-    # Status bar at top + scroll region for the rest. The bar (model, URL,
-    # commands, log path) stays pinned at row 1 no matter how long the session
-    # runs; everything else — banner, chat, model output, tool boxes — lives
-    # in rows 2..rows and scrolls within that region. This replaces the old
-    # "print N blank lines to push the banner to the bottom" trick, which was
-    # both fragile (depends on banner height) and one-shot (the banner
-    # scrolled away the moment anything was printed). Skipped when stdout
-    # isn't a TTY (piped/redirected — would inject escape codes into a log
-    # file) or when the user passes --no-scroll-bottom.
-    _setup_status_bar()
+    # `minion sessions [query]` — discover + exit, no REPL. Checked first so
+    # it short-circuits before the banner / network source resolution that the
+    # interactive loop depends on.
+    if _cli_sessions(sys.argv[1:]):
+        return
+    # The banner (model, source, approval level, endpoint) is printed at
+    # startup and reprinted on /source, /yolo, /approval switches. Previously
+    # this was a pinned status bar via a DECSTBM scroll region, but that
+    # broke terminal scrollback (lines scrolling off the region top never
+    # entered the scrollback buffer). Now we print normally and scroll
+    # naturally, so all output lands in scrollback as expected.
     print(_banner())
     print()
     messages = [{"role": "system", "content": SYSTEM}]
     history = []  # past user submissions, newest last; Up/Down navigates
+
+    # --- session state ------------------------------------------------------
+    # Every minion run has a session id. If the user passed --resume / -r
+    # (with an id, prefix, index, or title) or --session <id>, we load that;
+    # otherwise a fresh id is minted. The session is auto-saved after each
+    # model turn (the messages array is the source of truth — we just write
+    # it to ~/.minion/sessions/<id>.json atomically). A session that never
+    # got any user input is never written to disk.
+    session_id = _session_id_from_args()
+    _resume_requested = any(a in ("--resume", "-r") for a in sys.argv[1:])
+    if session_id is None:
+        if _resume_requested:
+            # bare `minion --resume` but no saved sessions exist — start fresh.
+            print(f"{DIM}  no saved sessions to resume — starting fresh{RESET}")
+        session_id = _new_session_id()
+    session_dirty = False  # has the in-memory context diverged from disk?
+    if _resume_requested or any(a == "--session" for a in sys.argv[1:]):
+        # Only attempt to load when the user explicitly asked to resume a
+        # specific (or most-recent) session. A plain `minion` run mints a
+        # fresh id above and starts with an empty context.
+        data = _load_session(session_id)
+        if data and isinstance(data.get("messages"), list):
+            messages = data["messages"]
+            # Drop the old system prompt and inject the current one so a
+            # resumed session picks up any SYSTEM edits / tool changes.
+            messages = [m for m in messages if m.get("role") != "system"]
+            messages.insert(0, {"role": "system", "content": SYSTEM})
+            n_msgs = len([m for m in messages if m.get("role") != "system"])
+            title = data.get("title") or "(untitled)"
+            print(f"{DIM}  ↻ resumed session {session_id} ({title!r}, "
+                  f"{n_msgs} messages){RESET}")
+            print()
+            # Show the conversation history so the user immediately remembers
+            # what the session was about before the first prompt.
+            if n_msgs:
+                print(f"{DIM}  ── transcript ──{RESET}")
+                _print_transcript(messages)
+                print(f"{DIM}  ──────────────{RESET}")
+                print()
+            # Restore the active source if the session recorded one.
+            src_name = data.get("source")
+            if src_name and src_name in SOURCES and src_name != ACTIVE.name:
+                switch_source(src_name)
+            session_dirty = False  # just loaded — in sync with disk
+        elif _resume_requested:
+            print(f"{YELLOW}  ✗ no saved session found for {session_id!r}; "
+                  f"starting fresh{RESET}")
+
+    def _save_current(meta=None):
+        """Persist the in-memory `messages` to the current session file.
+
+        Title is auto-derived from the first user message (unless the user
+        has set one explicitly with /save <title>). Source and cwd are
+        recorded so a resume can re-select the right endpoint.
+        """
+        if session_id is None:
+            return
+        m = dict(meta or {})
+        if "title" not in m:
+            first_user = ""
+            for msg in messages:
+                if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                    first_user = msg["content"]
+                    break
+            t = _safe_title(first_user)
+            if t:
+                m["title"] = t
+        m.setdefault("source", ACTIVE.name if ACTIVE else None)
+        m.setdefault("cwd", os.getcwd())
+        m.setdefault("model", MODEL)
+        try:
+            _write_session(session_id, messages, m)
+        except OSError as e:
+            print(f"{RED}  ✗ couldn't save session: {type(e).__name__}: {e}{RESET}")
+
     while True:
         try:
             user = read_multiline(history=history)
         except (EOFError, KeyboardInterrupt):
             print()
+            # Flush the current session on Ctrl-D / Ctrl-C exit so the last
+            # turn isn't lost (matches Hermes's exit-path flush).
+            if session_dirty:
+                _save_current()
+            # Show a grey resume hint so the user can pick up right where they
+            # left off without having to run `minion sessions` first.
+            if session_id:
+                print(f"{DIM}  resume with: minion --resume {session_id}{RESET}")
             break
         user = user.strip()
         if not user:
             continue
         if user == "/quit":
+            if session_dirty:
+                _save_current()
             break
         if user == "/source" or user.startswith("/source "):
             sp = user.split()
@@ -1668,6 +2010,7 @@ def main():
                 src = SOURCES[target]
                 print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
                 _paint_status_bar()
+                session_dirty = True  # source change is worth persisting
             continue
         if user == "/yolo":
             YOLO = not YOLO
@@ -1703,6 +2046,11 @@ def main():
         if user == "/reset":
             messages = [{"role": "system", "content": SYSTEM}]
             print(f"{DIM}  context cleared{RESET}")
+            # A reset forks a new session id so the fresh chat isn't written
+            # over the old one (mirrors Hermes's "new session on /new").
+            session_id = _new_session_id()
+            session_dirty = False
+            print(f"{DIM}  new session {session_id}{RESET}")
             continue
         if user in ("/compress", "/compact"):
             # nothing to compress if we're under (system + KEEP) turns
@@ -1725,6 +2073,32 @@ def main():
             kept_n, summarized_n, summary_chars = result
             print(f"{DIM}  └ compressed {summarized_n} turns → 1 summary "
                   f"({summary_chars} chars), kept last {kept_n} verbatim{RESET}")
+            session_dirty = True
+            continue
+        # --- session commands -------------------------------------------------
+        if user == "/sessions" or user.startswith("/sessions "):
+            _cmd_sessions(user, session_id)
+            continue
+        if user == "/resume" or user.startswith("/resume "):
+            new_sid = _cmd_resume(user, session_id)
+            if new_sid:
+                # Persist the outgoing session before switching away.
+                if session_dirty:
+                    _save_current()
+                session_id = new_sid
+                messages[:] = _session_messages(session_id)
+                session_dirty = False
+            continue
+        if user == "/save" or user.startswith("/save "):
+            title = user.split(None, 1)[1].strip() if " " in user else None
+            _save_current({"title": title} if title else {})
+            session_dirty = False
+            shown = f" as {title!r}" if title else ""
+            print(f"{DIM}  ✓ saved session {session_id}{shown}{RESET}")
+            continue
+        if user == "/delete" or user.startswith("/delete "):
+            target = user.split(None, 1)[1].strip() if " " in user else None
+            _cmd_delete(target, session_id)
             continue
         # record for history (skip duplicates of the very last entry so
         # Up doesn't immediately re-show what was just submitted)
@@ -1747,6 +2121,267 @@ def main():
             if status == TURN_TOOL:
                 reasoning_loop_cuts = 0
                 continue
+        # Auto-save after the turn settles (whether it ended cleanly, hit the
+        # step cap, or was escaped). This is the Hermes pattern: persist every
+        # turn so a crash / accidental close never loses work.
+        session_dirty = True
+        _save_current()
+        # Maybe refresh the model-generated description (a cheap non-streaming
+        # call every SESSION_DESC_REFRESH turns). Done after the save so the
+        # turn's messages are already on disk; the description lands as a
+        # second write. Failures are silent — the title is always present.
+        _maybe_refresh_description(session_id, messages)
+        session_dirty = False
+
+
+def _session_id_from_args():
+    """Resolve a starting session id from CLI flags: --resume/-r and --session.
+
+    `--resume` with no following target resumes the most recent session
+    (the natural "pick up where I left off" intent). With a target it resolves
+    by index/id/prefix/title. `--session <id>` forces an exact id (creates if
+    absent — useful for scripts that want a stable id)."""
+    args = sys.argv[1:]
+    out = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--resume", "-r"):
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                # --resume <target>
+                target = args[i + 1]
+                sessions = _list_sessions(limit=50)
+                out = _resolve_session(target, sessions) or target
+                i += 2
+            else:
+                # bare --resume → most recent session, if any
+                sessions = _list_sessions(limit=1)
+                out = sessions[0]["id"] if sessions else None
+                i += 1
+            continue
+        if a == "--session" and i + 1 < len(args):
+            out = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _session_messages(session_id):
+    """Load just the messages list for a session, with the live SYSTEM prepended."""
+    data = _load_session(session_id) or {}
+    msgs = [m for m in data.get("messages", []) if m.get("role") != "system"]
+    msgs.insert(0, {"role": "system", "content": SYSTEM})
+    return msgs
+
+
+def _fmt_when(ts):
+    """Compact relative timestamp for the session list."""
+    if not ts:
+        return "?"
+    delta = time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    if delta < 86400 * 7:
+        return f"{int(delta // 86400)}d ago"
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _print_transcript(messages, max_chars=120):
+    """Render a session's message history as a one-line-per-message recap.
+
+    Used on resume so the user immediately sees what the conversation was
+    about, and by `/sessions <id>` for its detail view. Each message is
+    collapsed to a single line (newlines → spaces) and truncated so the whole
+    history reads as a scannable timeline rather than a wall of text. Tool
+    calls render as `→ name(...)` so you can see what ran. System messages
+    are skipped. Returns the number of lines printed."""
+    printed = 0
+    for m in messages:
+        role = m.get("role", "?")
+        if role == "system":
+            continue
+        content = m.get("content")
+        if content is None and m.get("tool_calls"):
+            calls = ", ".join(
+                f"{tc['function']['name']}(...)" for tc in m["tool_calls"])
+            content = f"→ {calls}"
+        elif isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        content = (content or "").strip().replace("\n", " ")
+        if len(content) > max_chars:
+            content = content[:max_chars - 1] + "…"
+        color = {"user": CYAN, "assistant": GREEN, "tool": DIM}.get(role, "")
+        print(f"  {color}{role:>9}{RESET}  {content}")
+        printed += 1
+    return printed
+
+
+def _cli_sessions(args):
+    """`minion sessions [query]` — list saved sessions and exit (no REPL).
+
+    With no query: prints the ~20 most recent. With a query: substring-filters
+    (case-insensitive) across title, first-message preview, and id, so once
+    you have dozens of sessions you can narrow with e.g.
+    `minion sessions refactor`. Returns True if it handled a listing request
+    (caller should then exit); False if this wasn't a sessions invocation.
+
+    Deliberately a top-level verb rather than `--resume list`: "list" looks
+    like it could be a session title, and a "resume" flag doing two different
+    things (list vs. switch) depending on whether it has an arg is the kind
+    of inconsistency that confuses. `sessions` = discover, `--resume` = enter.
+    """
+    if not args:
+        return False
+    if args[0] not in ("sessions", "--sessions", "ls", "list"):
+        return False
+    query = " ".join(args[1:]).strip() or None
+    sessions = _list_sessions(limit=50)
+    if query:
+        q = query.lower()
+        sessions = [s for s in sessions
+                    if q in (s.get("title") or "").lower()
+                    or q in (s.get("preview") or "").lower()
+                    or q in (s.get("id") or "").lower()]
+    if not sessions:
+        if query:
+            print(f"  no sessions matching {query!r}")
+        else:
+            print(f"  no saved sessions yet  ({_sessions_dir()})")
+        return True
+    where = f" matching {query!r}" if query else ""
+    print(f"{DIM}  sessions{where} — {_sessions_dir()}{RESET}")
+    for i, s in enumerate(sessions, 1):
+        title = s["title"] or "(empty)"
+        badge = ""
+        if s.get("source"):
+            badge = f"{DIM} · {s['source']}{RESET}"
+        print(f"  {DIM}{i:>3}{RESET}  {MAGENTA}{s.get('short', _short_id(s['id']))}{RESET}  "
+              f"{title}{DIM} · {s['n']} msg · "
+              f"{_fmt_when(s['updated_at'])}{badge}{RESET}")
+        # Prefer the live model-generated description (tracks the task);
+        # fall back to the first-message preview if there isn't one yet.
+        desc = s.get("description") or (s.get("preview") if s.get("preview") != title else None)
+        if desc:
+            print(f"       {DIM}{desc}{RESET}")
+    print(f"{DIM}  resume with: minion --resume <n|short-id|title>{RESET}")
+    return True
+
+
+def _cmd_sessions(user, current_id):
+    """Handle /sessions [n] — list recent sessions, or show one in detail."""
+    parts = user.split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        sessions = _list_sessions(limit=15)
+        if not sessions:
+            print(f"{DIM}  no saved sessions yet (saved to {SESSION_HOME}/sessions){RESET}")
+            return
+        print(f"{DIM}  recent sessions ({_sessions_dir()}):{RESET}")
+        for i, s in enumerate(sessions, 1):
+            mark = f"{GREEN}●{RESET}" if s["id"] == current_id else f"{DIM}{i:>2}{RESET}"
+            when = _fmt_when(s["updated_at"])
+            title = s["title"] or "(empty)"
+            extra = f" · {s['n']} msg"
+            if s.get("source"):
+                extra += f" · {s['source']}"
+            print(f"  {mark} {MAGENTA}{s.get('short', _short_id(s['id']))}{RESET}  "
+                  f"{title}{DIM}{extra} · {when}{RESET}")
+            desc = s.get("description") or (s.get("preview") if s.get("preview") != title else None)
+            if desc:
+                print(f"        {DIM}{desc}{RESET}")
+        print(f"{DIM}  /resume <n|short-id|title> to switch · /delete <n|id> to remove{RESET}")
+        return
+    # /sessions <target> — show detail for one session
+    sessions = _list_sessions(limit=50)
+    sid = _resolve_session(arg, sessions)
+    if not sid:
+        print(f"{YELLOW}  no session matching {arg!r}{RESET}")
+        return
+    data = _load_session(sid)
+    if not data:
+        print(f"{YELLOW}  ✗ couldn't read session {sid}{RESET}")
+        return
+    msgs = data.get("messages", [])
+    title = data.get("title") or "(untitled)"
+    print(f"{DIM}  session {sid}{RESET}")
+    print(f"{DIM}  title: {title}{RESET}")
+    print(f"{DIM}  messages: {len(msgs)} · updated {_fmt_when(data.get('updated_at', 0))}{RESET}")
+    print(f"{DIM}  ── transcript ──{RESET}")
+    _print_transcript(msgs)
+
+
+def _cmd_resume(user, current_id):
+    """Handle /resume [target] — pick a session to resume. Returns the new id
+    or None if nothing changed."""
+    parts = user.split(None, 1)
+    target = parts[1].strip() if len(parts) > 1 else ""
+    sessions = _list_sessions(limit=15)
+    if not target:
+        if not sessions:
+            print(f"{DIM}  no saved sessions to resume{RESET}")
+            return None
+        print(f"{DIM}  recent sessions:{RESET}")
+        for i, s in enumerate(sessions, 1):
+            mark = f"{GREEN}●{RESET}" if s["id"] == current_id else f"{DIM}{i:>2}{RESET}"
+            title = s["title"] or "(empty)"
+            print(f"  {mark} {MAGENTA}{s.get('short', _short_id(s['id']))}{RESET}  "
+                  f"{title}{DIM} · {s['n']} msg · {_fmt_when(s['updated_at'])}{RESET}")
+            desc = s.get("description") or (s.get("preview") if s.get("preview") != title else None)
+            if desc:
+                print(f"        {DIM}{desc}{RESET}")
+        print(f"{DIM}  /resume <n|short-id|prefix|title> to switch{RESET}")
+        return None
+    target = target.strip()
+    # Let the user strip surrounding <> [] "" they may have copied from help.
+    if len(target) >= 2 and target[0] in "<[\"'" and target[-1] in ">]\"'":
+        target = target[1:-1].strip()
+    sessions = _list_sessions(limit=50)
+    sid = _resolve_session(target, sessions)
+    if not sid:
+        print(f"{YELLOW}  ✗ no session matching {target!r}{RESET}")
+        return None
+    if sid == current_id:
+        print(f"{DIM}  already on that session{RESET}")
+        return None
+    data = _load_session(sid)
+    if not data:
+        print(f"{YELLOW}  ✗ couldn't read session {sid}{RESET}")
+        return None
+    # Reselect the recorded source if it's configured, so a resume lands on
+    # the same endpoint the session started on.
+    src = data.get("source")
+    if src and src in SOURCES and src != ACTIVE.name:
+        switch_source(src)
+        print(f"{BOLD}{YELLOW}  → source {src}{RESET} {DIM}({MODEL}){RESET}")
+    n_msgs = len([m for m in data.get("messages", []) if m.get("role") != "system"])
+    title = data.get("title") or "(untitled)"
+    print(f"{DIM}  ↻ resumed {sid} ({title!r}, {n_msgs} messages){RESET}")
+    print()
+    return sid
+
+
+def _cmd_delete(target, current_id):
+    """Handle /delete [target] — remove a session file."""
+    if not target:
+        print(f"{YELLOW}  usage: /delete <n|id|prefix>  (use /sessions to list){RESET}")
+        return
+    sessions = _list_sessions(limit=50)
+    sid = _resolve_session(target, sessions)
+    if not sid:
+        print(f"{YELLOW}  ✗ no session matching {target!r}{RESET}")
+        return
+    if sid == current_id:
+        print(f"{YELLOW}  can't delete the session you're currently in — /reset first{RESET}")
+        return
+    if _delete_session(sid):
+        print(f"{DIM}  ✓ deleted session {sid}{RESET}")
+    else:
+        print(f"{YELLOW}  ✗ couldn't delete session {sid}{RESET}")
 
 
 if __name__ == "__main__":
