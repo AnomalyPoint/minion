@@ -8,6 +8,11 @@ import io
 import sys
 import importlib
 import os
+import tempfile
+
+_tmp = tempfile.mkdtemp(prefix="minion-test-")
+os.environ["MINION_SESSIONS_DIR"] = _tmp
+os.environ["MINION_HOME"] = _tmp
 
 # load module fresh — add project root (parent of this tests/ dir) to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,7 +35,8 @@ def fake_compress(msgs, keep=m.COMPRESS_KEEP):
     return (2, 3, 42)
 
 def fake_model_turn(msgs, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
-                    forced_final=False):
+                    gibberish_cut_count=0, forced_final=False,
+                    recovery_sampling=False):
     return False  # no tool calls → REPL moves to next prompt
 
 # capture stdout so we can compare

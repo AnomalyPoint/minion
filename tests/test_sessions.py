@@ -8,19 +8,37 @@ import json
 import os
 import sys
 import tempfile
-import time
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import minion as m
 
 # Point MINION_SESSIONS_DIR at a temp dir so we never touch ~/.minion.
 _tmp = tempfile.mkdtemp(prefix="minion-test-")
 os.environ["MINION_SESSIONS_DIR"] = _tmp
 os.environ["MINION_HOME"] = _tmp  # belt-and-suspenders
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import minion as m
+
+
+def _use_test_sessions_dir():
+    os.environ["MINION_SESSIONS_DIR"] = _tmp
+    os.environ["MINION_HOME"] = _tmp
+    return m._sessions_dir()
+
+
+def setup_function(_function):
+    _use_test_sessions_dir()
+
 
 def _msg(role, content):
     return {"role": role, "content": content}
+
+
+def _clear_test_sessions_dir():
+    d = _use_test_sessions_dir()
+    assert os.path.basename(d).startswith("minion-test-"), d
+    for f in os.listdir(d):
+        if f.endswith(".json"):
+            os.remove(os.path.join(d, f))
+    return d
 
 
 def test_write_load_roundtrip():
@@ -58,17 +76,13 @@ def test_load_missing_returns_none():
 
 def test_list_sessions_orders_newest_first_with_preview():
     # clear any sessions left over by earlier tests in this shared temp dir
-    d = m._sessions_dir()
-    for f in os.listdir(d):
-        if f.endswith(".json"):
-            os.remove(os.path.join(d, f))
+    _clear_test_sessions_dir()
     texts = ["aaa", "bbb", "ccc"]
     sids = []
-    for txt in texts:
-        sid = m._new_session_id()
-        m._write_session(sid, [_msg("user", txt)])
+    for i, txt in enumerate(texts):
+        sid = f"20250101-12000{i}-order{i}"
+        m._write_session(sid, [_msg("user", txt)], {"updated_at": 100 + i})
         sids.append(sid)
-        time.sleep(0.01)  # ensure distinct updated_at timestamps
     sessions = m._list_sessions()
     # written last → newest → should appear first
     assert sessions[0]["id"] == sids[-1], f"newest first; got {sessions[0]['id']}"
@@ -92,6 +106,31 @@ def test_resolve_session_supports_index_prefix_title():
     # ambiguous / unknown → None
     assert m._resolve_session("nope-no-such", sessions) is None
     print("PASS — resolve handles index / id / prefix / title")
+
+
+def test_list_sessions_without_query_stops_at_limit():
+    _clear_test_sessions_dir()
+    for i in range(20):
+        m._write_session(f"20250101-1300{i:02d}-limit{i:02d}",
+                         [_msg("user", f"limited {i:02d}")],
+                         {"updated_at": 200 + i})
+
+    seen = []
+    original = m._session_summary_from_file
+
+    def wrapped(fname):
+        seen.append(fname)
+        return original(fname)
+
+    m._session_summary_from_file = wrapped
+    try:
+        sessions = m._list_sessions(limit=5)
+    finally:
+        m._session_summary_from_file = original
+
+    assert len(sessions) == 5
+    assert len(seen) == 5, f"parsed {len(seen)} files instead of stopping at limit"
+    print("PASS — recent listing stops after the requested page")
 
 
 def test_delete_session():
@@ -125,19 +164,15 @@ def test_safe_title_collapses_and_clamps():
 def test_bare_resume_picks_most_recent():
     """`minion --resume` (no target) should resume the newest session."""
     # clear the temp dir first
-    d = m._sessions_dir()
-    for f in os.listdir(d):
-        if f.endswith(".json"):
-            os.remove(os.path.join(d, f))
+    _clear_test_sessions_dir()
     # no sessions yet → bare --resume resolves to None (clean fresh start)
     sys.argv = ["minion.py", "--resume"]
     assert m._session_id_from_args() is None, "should be None with no sessions"
     # now create two sessions; newest should win
-    old = m._new_session_id()
-    m._write_session(old, [_msg("user", "old")])
-    time.sleep(0.01)
-    newest = m._new_session_id()
-    m._write_session(newest, [_msg("user", "newest")])
+    old = "20250101-120000-old123"
+    m._write_session(old, [_msg("user", "old")], {"updated_at": 100})
+    newest = "20250101-120001-new123"
+    m._write_session(newest, [_msg("user", "newest")], {"updated_at": 101})
     sys.argv = ["minion.py", "--resume"]
     resolved = m._session_id_from_args()
     assert resolved == newest, f"bare --resume should pick newest {newest}, got {resolved}"
@@ -159,30 +194,52 @@ def test_resume_flag_without_target_ignores_following_dash_flags():
 
 
 def test_cli_sessions_list_and_filter():
-    """`minion sessions` lists + exits; `minion sessions <q>` filters."""
+    """`minion sessions` pages recent sessions; filters can search older ones."""
     import io, contextlib
     # seed a known set
-    d = m._sessions_dir()
-    for f in os.listdir(d):
-        if f.endswith(".json"):
-            os.remove(os.path.join(d, f))
-    m._write_session(m._new_session_id(),
+    _clear_test_sessions_dir()
+    for i in range(12):
+        m._write_session(f"20250101-1200{i:02d}-page{i:02d}",
+                         [_msg("user", f"topic {i:02d}")],
+                         {"title": f"topic {i:02d}", "updated_at": 100 + i})
+    m._write_session("20250101-115000-auth00",
                      [_msg("user", "refactor the auth module")],
-                     {"title": "auth refactor"})
-    m._write_session(m._new_session_id(),
+                     {"title": "auth refactor", "updated_at": 50})
+    m._write_session("20250101-114900-css000",
                      [_msg("user", "fix the css bug")],
-                     {"title": "css bugfix"})
+                     {"title": "css bugfix", "updated_at": 49})
 
-    # bare `sessions` → lists both
+    # bare `sessions` → first page only
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         handled = m._cli_sessions(["sessions"])
     assert handled is True, "sessions should report it handled the request"
     out = buf.getvalue()
-    assert "auth refactor" in out and "css bugfix" in out, out
+    assert "20250101-120011-page11" in out and "topic 02" in out, out
+    assert "first: topic 11" in out, out
+    assert "topic 01" not in out and "auth refactor" not in out, out
     assert "resume with" in out, "should show the resume hint"
+    assert "next page" in out, "should show the pagination hint"
 
-    # filter narrows to one
+    # --sessions is the same paged listing path
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        handled = m._cli_sessions(["--sessions", "--limit", "5"])
+    assert handled is True
+    out = buf.getvalue()
+    assert "topic 11" in out and "topic 07" in out, out
+    assert "topic 06" not in out, out
+
+    # page 2 shows the older tail of the list
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        handled = m._cli_sessions(["sessions", "--page", "2"])
+    assert handled is True
+    out = buf.getvalue()
+    assert "topic 01" in out and "auth refactor" in out, out
+    assert "topic 11" not in out, out
+
+    # filter searches beyond the first page
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         handled = m._cli_sessions(["sessions", "auth"])
@@ -209,6 +266,7 @@ if __name__ == "__main__":
     test_load_missing_returns_none()
     test_list_sessions_orders_newest_first_with_preview()
     test_resolve_session_supports_index_prefix_title()
+    test_list_sessions_without_query_stops_at_limit()
     test_delete_session()
     test_new_session_id_is_unique_and_sortable()
     test_safe_title_collapses_and_clamps()

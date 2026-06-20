@@ -26,10 +26,12 @@ Multiple sources — define named endpoints and switch between them at runtime:
 Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
 
   python minion.py sessions           # list saved sessions (prints + exits)
+  python minion.py sessions --page 2  # next page of saved sessions
   python minion.py sessions refactor  # …filtered by a substring query
   python minion.py --resume <id|short-id|prefix|title>  # resume a past session
   python minion.py --resume 1                        # resume the most recent
   /sessions                       # list recent sessions (with short ids)
+  /sessions --page 2              # next page of recent sessions
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
@@ -43,6 +45,7 @@ import random
 import re
 import secrets
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -101,6 +104,8 @@ _load_env_file()
 SESSION_HOME = os.path.expanduser(
     os.environ.get("MINION_HOME", "~/.minion")
 )
+SESSION_LIST_DEFAULT_LIMIT = 10
+SESSION_LIST_MAX_LIMIT = 100
 
 
 def _sessions_dir():
@@ -173,6 +178,10 @@ def _write_session(session_id, messages, meta=None):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, path)
+    try:
+        os.utime(path, (data["updated_at"], data["updated_at"]))
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def _load_session(session_id):
@@ -188,48 +197,101 @@ def _load_session(session_id):
     return None
 
 
-def _list_sessions(limit=20):
+def _session_files_newest():
+    """Return session JSON filenames newest-first using filesystem mtimes.
+
+    Listing many sessions should not require parsing every old transcript.
+    The session writer keeps mtime aligned with updated_at, so this is a
+    cheap index for recent-session browsing.
+    """
+    d = _sessions_dir()
+    files = []
+    try:
+        with os.scandir(d) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                    files.append((entry.stat().st_mtime, entry.name))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    files.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [name for _, name in files]
+
+
+def _session_summary_from_file(fname):
+    d = _sessions_dir()
+    path = os.path.join(d, fname)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "messages" not in data:
+            return None
+    except (OSError, IOError, json.JSONDecodeError):
+        return None
+
+    sid = data.get("id") or fname[:-5]
+    msgs = data.get("messages", [])
+    preview = ""
+    for m in msgs:
+        if m.get("role") == "user" and m.get("content"):
+            preview = _safe_title(m["content"]) or ""
+            break
+    return {
+        "id": sid,
+        "short": _short_id(sid),
+        "title": data.get("title") or preview or "(empty)",
+        "description": data.get("description"),
+        "preview": preview,
+        "updated_at": data.get("updated_at", 0),
+        "n": len([m for m in msgs if m.get("role") != "system"]),
+        "model": data.get("model"),
+        "source": data.get("source"),
+        "cwd": data.get("cwd"),
+    }
+
+
+def _session_matches_query(summary, query):
+    if not query:
+        return True
+    q = query.lower()
+    return (
+        q in (summary.get("title") or "").lower()
+        or q in (summary.get("description") or "").lower()
+        or q in (summary.get("preview") or "").lower()
+        or q in (summary.get("id") or "").lower()
+        or q in (summary.get("short") or "").lower()
+    )
+
+
+def _list_sessions(limit=20, offset=0, query=None):
     """Return sessions newest-first as dicts: id, title, description, preview, n.
 
     `preview` is the first ~60 chars of the first user message; `description`
     is an optional model-generated one-liner refreshed every N turns (richer
     than the static first-message title). `n` is the turn count (non-system
     messages)."""
-    d = _sessions_dir()
-    try:
-        files = [f for f in os.listdir(d) if f.endswith(".json")]
-    except OSError:
-        return []
+    limit = max(0, int(limit)) if limit is not None else None
+    offset = max(0, int(offset or 0))
+    files = _session_files_newest()
     out = []
     for fname in files:
-        path = os.path.join(d, fname)
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or "messages" not in data:
-                continue
-        except (OSError, IOError, json.JSONDecodeError):
+        summary = _session_summary_from_file(fname)
+        if not summary or not _session_matches_query(summary, query):
             continue
-        sid = data.get("id") or fname[:-5]
-        msgs = data.get("messages", [])
-        preview = ""
-        for m in msgs:
-            if m.get("role") == "user" and m.get("content"):
-                preview = _safe_title(m["content"]) or ""
-                break
-        out.append({
-            "id": sid,
-            "short": _short_id(sid),
-            "title": data.get("title") or preview or "(empty)",
-            "description": data.get("description"),
-            "preview": preview,
-            "updated_at": data.get("updated_at", 0),
-            "n": len([m for m in msgs if m.get("role") != "system"]),
-            "model": data.get("model"),
-            "source": data.get("source"),
-        })
-    out.sort(key=lambda s: s["updated_at"], reverse=True)
-    return out[:limit]
+        out.append(summary)
+        if query:
+            continue
+        if limit is not None and len(out) >= offset + limit:
+            break
+    if query:
+        out.sort(key=lambda s: s["updated_at"], reverse=True)
+    end = None if limit is None else offset + limit
+    return out[offset:end]
 
 
 def _delete_session(session_id):
@@ -871,6 +933,13 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 def _abbr(n):
     """Compact token count for the stats footer: 832 → '832', 1500 → '1.5K',
     78825 → '78K', 1234567 → '1.2M'. Keeps the footer tidy once context grows."""
@@ -885,6 +954,23 @@ def _abbr(n):
         return f"{n / 1_000_000:.1f}M"
     return f"{n // 1_000_000}M"
 
+
+def _precise_abbr(n):
+    """Like _abbr but keeps two decimals in the K/M/B ranges.
+
+    Used for the live tool-call-args counter ("generating tool call write_file
+    args 25.15K chars"), where watching the number tick up as args stream in
+    is part of the feedback — so we don't want to round 25,152 down to '25K'.
+    832 → '832', 25152 → '25.15K', 1234567 → '1.23M'."""
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.2f}K"
+    if n < 1_000_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    return f"{n // 1_000_000_000}B"
+
 REASONING_LOOP_SIGNALS = (
     "start coding",
     "let me implement",
@@ -898,7 +984,10 @@ REASONING_LOOP_SIGNALS = (
 )
 REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
 REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 12000)
+REASONING_GIBBERISH_CHARS = _env_int("MINION_REASONING_GIBBERISH_CHARS", 600)
 MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 8192)
+RECOVERY_TEMPERATURE = _env_float("MINION_RECOVERY_TEMPERATURE", 0.2)
+RECOVERY_TOP_P = _env_float("MINION_RECOVERY_TOP_P", 0.95)
 RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
 RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
@@ -926,6 +1015,7 @@ REASONING_LOOP_NUDGES = (
 REASONING_LOOP_RETRY_LIMIT = _env_int(
     "MINION_REASONING_LOOP_RETRIES", len(REASONING_LOOP_NUDGES))
 REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
+REASONING_GIBBERISH_RETRY_LIMIT = _env_int("MINION_REASONING_GIBBERISH_RETRIES", 1)
 MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
 FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 1024)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
@@ -1192,7 +1282,31 @@ def run_tool(name, args):
     return result
 
 
-def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None):
+def _tool_args_parse_error(c, err, finish_reasons=None):
+    name = c.get("name") or "tool"
+    args_text = c.get("args") or ""
+    detail = f"{name} arguments are not valid JSON"
+    if args_text:
+        detail += f" ({_abbr(len(args_text))} chars"
+        if finish_reasons:
+            detail += f"; finish_reason={','.join(finish_reasons)}"
+        detail += f"; {err.msg} at char {err.pos})"
+    else:
+        detail += f" ({err.msg} at char {err.pos})"
+    return detail
+
+
+def _recovery_sampling_opts():
+    opts = {}
+    if RECOVERY_TEMPERATURE >= 0:
+        opts["temperature"] = RECOVERY_TEMPERATURE
+    if RECOVERY_TOP_P >= 0:
+        opts["top_p"] = RECOVERY_TOP_P
+    return opts
+
+
+def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
+                recovery_sampling=False):
     """Open a streaming completion. Retries without tools= if the server rejects
     that param; returns None (after a friendly message) on connection/API failure."""
     try:
@@ -1200,6 +1314,8 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None):
         request_opts = {}
         if token_limit > 0:
             request_opts["max_tokens"] = token_limit
+        if recovery_sampling:
+            request_opts.update(_recovery_sampling_opts())
         if tool_choice is not None:
             request_opts["tool_choice"] = tool_choice
         try:
@@ -1396,13 +1512,76 @@ class _ReasoningLoopSignalCounter:
         return self.hits
 
 
+def _reasoning_gibberish_reason(sample):
+    """Return a short reason when reasoning text has collapsed into junk.
+
+    This intentionally targets the observed failure mode: dense numeric/markup
+    noise in reasoning_content before the model emits content or a tool call.
+    It is not a general "weird text" filter.
+    """
+    sample = sample.strip()
+    n = len(sample)
+    if n < 180:
+        return None
+
+    whitespace_ratio = sum(c.isspace() for c in sample) / n
+    digit_ratio = sum(c.isdigit() for c in sample) / n
+    alpha_ratio = sum(c.isalpha() for c in sample) / n
+    punct_ratio = sum((not c.isalnum() and not c.isspace()) for c in sample) / n
+    markup_hits = len(re.findall(
+        r"(?:</|<a\b|div|span|href|class|svg|var)\w*", sample, re.I))
+
+    score = 0
+    reasons = []
+    if digit_ratio > 0.65 and whitespace_ratio < 0.10:
+        score += 3
+        reasons.append("mostly digits")
+    elif digit_ratio > 0.42 and whitespace_ratio < 0.08:
+        score += 2
+        reasons.append("dense digits")
+    if re.search(r"\d{28,}", sample):
+        score += 1
+        reasons.append("long numeric run")
+    if markup_hits >= 10 and whitespace_ratio < 0.12:
+        score += 2
+        reasons.append("markup fragments")
+    elif markup_hits >= 16:
+        score += 1
+        reasons.append("many markup fragments")
+    if re.search(r"\b([A-Za-z]{2,8})\1{2,}\b", sample):
+        score += 1
+        reasons.append("repeated fragments")
+    if whitespace_ratio < 0.06 and punct_ratio > 0.10 and alpha_ratio < 0.38:
+        score += 1
+        reasons.append("compact symbol soup")
+
+    if score >= 3:
+        return ", ".join(reasons[:2]) or "unreadable reasoning"
+    return None
+
+
+class _ReasoningGibberishDetector:
+    def __init__(self, window):
+        self.window = max(0, int(window))
+        self.buf = ""
+        self.min_chars = min(240, self.window) if self.window else 0
+
+    def feed(self, chunk):
+        if not self.window:
+            return None
+        self.buf = (self.buf + chunk)[-self.window:]
+        if len(self.buf) < self.min_chars:
+            return None
+        return _reasoning_gibberish_reason(self.buf)
+
+
 def _tool_call_progress(tcs):
     parts = []
     for i in sorted(tcs):
         c = tcs[i]
         name = c["name"] or "tool"
         args_n = len(c["args"])
-        parts.append(f"{name} args {_abbr(args_n)} chars" if args_n else f"{name} ...")
+        parts.append(f"{name} args {_precise_abbr(args_n)} chars" if args_n else f"{name} ...")
     return ", ".join(parts) if parts else "tool call ..."
 
 
@@ -1410,13 +1589,14 @@ TURN_DONE = "done"
 TURN_TOOL = "tool"
 TURN_LOOP_CUT = "loop_cut"
 TURN_STREAM_CUT = "stream_cut"
+TURN_GIBBERISH_CUT = "gibberish_cut"
 TURN_FORCE_FINAL = "force_final"
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
 
 # --- one model turn (streamed), returns TURN_* status -----------------------
 def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
-               forced_final=False):
+               gibberish_cut_count=0, forced_final=False, recovery_sampling=False):
     # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
     # watcher-setup window (which can be tens of ms on a warm local server but
     # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
@@ -1429,7 +1609,9 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     t0 = time.time()
     spinner_label = (
         "forcing final answer · esc to interrupt"
-        if forced_final else "thinking · esc to interrupt"
+        if forced_final else
+        "recovering · esc to interrupt" if recovery_sampling else
+        "thinking · esc to interrupt"
     )
     spinner = LifeSpinner(label=spinner_label)
     spinner.start()
@@ -1440,9 +1622,10 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 tools=[FINAL_ANSWER_TOOL],
                 tool_choice=FINAL_ANSWER_TOOL_CHOICE,
                 max_tokens=FORCED_FINAL_MAX_TOKENS,
+                recovery_sampling=recovery_sampling,
             )
         else:
-            stream = open_stream(messages)
+            stream = open_stream(messages, recovery_sampling=recovery_sampling)
     except Exception:
         spinner.stop()
         raise
@@ -1464,11 +1647,14 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     usage = None
     t_first = None   # time of first output token (for TTFT)
     loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
+    gibberish = _ReasoningGibberishDetector(REASONING_GIBBERISH_CHARS)
     loop_cut = False
     loop_cut_reason = "signals"
+    gibberish_reason = None
     reasoning_only_chars = 0
     stream_error = None
     interrupted = False
+    finish_reasons = []
     tool_status_active = False
     last_tool_status = 0.0
 
@@ -1516,7 +1702,10 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             # else to do with it.
             if not chunk.choices:
                 continue
-            d = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                finish_reasons.append(str(choice.finish_reason))
+            d = choice.delta
             # Capture TTFT on the first chunk carrying real output (reasoning,
             # content, or tool calls).
             if t_first is None:
@@ -1537,6 +1726,19 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             # run straight into the answer).
             rc = getattr(d, "reasoning_content", None) or (d.model_extra or {}).get("reasoning_content")
             if rc:
+                if not content and not tcs and REASONING_GIBBERISH_CHARS > 0:
+                    gibberish_reason = gibberish.feed(rc)
+                    if gibberish_reason:
+                        if mode == "think":
+                            print()
+                        print(f"{RED}  ⚠ REASONING GIBBERISH DETECTED — "
+                              f"{gibberish_reason}; cutting stream now{RESET}")
+                        loop_cut = True
+                        loop_cut_reason = "gibberish"
+                        close = getattr(stream, "close", None)
+                        if close:
+                            close()
+                        break
                 if mode != "think":
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
@@ -1686,52 +1888,69 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         return TURN_DONE
 
     if loop_cut:
-        retry_limit = max(0, (
-            REASONING_ONLY_RETRY_LIMIT
-            if loop_cut_reason == "reasoning_only"
-            else REASONING_LOOP_RETRY_LIMIT
-        ))
-        loop_detail = (
-            f"{loop_signals.hits} ready-to-act signals"
-            if loop_cut_reason == "signals"
-            else f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls"
-        )
+        if loop_cut_reason == "reasoning_only":
+            retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
+            cut_count = reasoning_loop_cut_count
+            loop_detail = (
+                f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls")
+        elif loop_cut_reason == "gibberish":
+            retry_limit = max(0, REASONING_GIBBERISH_RETRY_LIMIT)
+            cut_count = gibberish_cut_count
+            loop_detail = f"unreadable reasoning noise ({gibberish_reason or 'detected'})"
+        else:
+            retry_limit = max(0, REASONING_LOOP_RETRY_LIMIT)
+            cut_count = reasoning_loop_cut_count
+            loop_detail = f"{loop_signals.hits} ready-to-act signals"
         if forced_final:
             print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — got {loop_detail}; "
                   f"returning to chat input{RESET}")
             return TURN_DONE
-        if reasoning_loop_cut_count >= retry_limit:
+        if cut_count >= retry_limit:
             if loop_cut_reason == "reasoning_only":
                 print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
-                      f"{reasoning_loop_cut_count} forced final "
-                      f"attempt{'s' if reasoning_loop_cut_count != 1 else ''} "
+                      f"{cut_count} forced final "
+                      f"attempt{'s' if cut_count != 1 else ''} "
                       f"× {loop_detail}; waiting for user input{RESET}")
+            elif loop_cut_reason == "gibberish":
+                print(f"{RED}  ✂ REASONING GIBBERISH RESCUE FAILED — gave up after "
+                      f"{cut_count} recover"
+                      f"{'ies' if cut_count != 1 else 'y'} × {loop_detail}; "
+                      f"waiting for user input{RESET}")
             else:
                 print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
-                      f"{reasoning_loop_cut_count} cut{'s' if reasoning_loop_cut_count != 1 else ''} "
+                      f"{cut_count} cut{'s' if cut_count != 1 else ''} "
                       f"× {loop_detail}; "
                       f"waiting for user input{RESET}")
             return TURN_DONE
         if loop_cut_reason == "signals":
             nudge = REASONING_LOOP_NUDGES[
-                min(reasoning_loop_cut_count, len(REASONING_LOOP_NUDGES) - 1)]
+                min(cut_count, len(REASONING_LOOP_NUDGES) - 1)]
             cut_msg = (f"{loop_signals.hits} ready-to-act signals "
                        f"(limit {REASONING_LOOP_SIGNAL_LIMIT})")
             print(f"{YELLOW}  ✂ REASONING LOOP CUT — {cut_msg}; nudging implementation "
-                  f"(retry {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
+                  f"(retry {cut_count + 1}/{retry_limit}){RESET}")
             _nudge_current_user_turn(messages, nudge)
             return TURN_LOOP_CUT
-        else:
+        if loop_cut_reason == "reasoning_only":
             cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
                        f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
             print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
-                  f"(attempt {reasoning_loop_cut_count + 1}/{retry_limit}){RESET}")
+                  f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
             _nudge_current_user_turn(
                 messages,
                 "Your previous streamed response produced reasoning only. Do not continue "
                 "private reasoning. You must now return a visible final answer. If you are "
                 "blocked, say exactly what is blocking you and what input is needed.")
             return TURN_FORCE_FINAL
+        print(f"{YELLOW}  ✂ REASONING GIBBERISH CUT — {loop_detail}; "
+              f"retrying with recovery sampling "
+              f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
+        _nudge_current_user_turn(
+            messages,
+            "Your previous reasoning stream became unreadable numeric/markup noise. "
+            "Discard it. Continue from the current task with either a valid tool call "
+            "or a concise visible answer.")
+        return TURN_GIBBERISH_CUT
 
     # stats footer — prefer llama.cpp timings if present; otherwise fall back
     # to the standard streaming `usage` object (OpenAI, Z.ai, etc.); otherwise
@@ -1796,15 +2015,39 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
 
     if tcs:  # native tool-calling path
         ordered = [tcs[i] for i in sorted(tcs)]
+        parsed_args = []
+        parse_error = None
+        for c in ordered:
+            try:
+                parsed_args.append(json.loads(c["args"] or "{}"))
+            except json.JSONDecodeError as e:
+                parse_error = (c, e)
+                break
+        if parse_error is not None:
+            c, err = parse_error
+            detail = _tool_args_parse_error(c, err, finish_reasons)
+            retry_limit = max(0, MALFORMED_STREAM_RETRY_LIMIT)
+            if malformed_stream_cut_count >= retry_limit:
+                print(f"{RED}  ✗ malformed tool call after "
+                      f"{malformed_stream_cut_count} recoveries — waiting for user input{RESET}")
+                print(f"{DIM}    {detail}{RESET}")
+                return TURN_DONE
+            print(f"{YELLOW}  ✂ MALFORMED TOOL CALL — {detail}; "
+                  f"discarded partial tool args and retrying cleanly "
+                  f"({malformed_stream_cut_count + 1}/{retry_limit}){RESET}")
+            _nudge_current_user_turn(
+                messages,
+                "Your previous native tool call had malformed or truncated JSON "
+                "arguments, so it was discarded before execution. Retry the same "
+                "task from the current conversation state, but emit a complete, "
+                "valid tool call with all required arguments. For large file "
+                "writes, emit only the tool call and skip any explanatory prose.")
+            return TURN_STREAM_CUT
         messages.append({"role": "assistant", "content": text or None, "tool_calls": [
             {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["args"]}}
             for c in ordered]})
         esc_action = None
-        for idx, c in enumerate(ordered):
-            try:
-                args = json.loads(c["args"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
+        for idx, (c, args) in enumerate(zip(ordered, parsed_args)):
             try:
                 result = run_tool(c["name"], args)
             except _EscToChat as e:
@@ -2371,11 +2614,15 @@ def main():
         steps = 0
         reasoning_loop_cuts = 0
         malformed_stream_cuts = 0
+        gibberish_cuts = 0
         force_final = False
+        recovery_sampling = False
         while steps < 25:  # cap runaway tool/retry loops
             status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
-                                forced_final=force_final)
+                                gibberish_cuts, forced_final=force_final,
+                                recovery_sampling=recovery_sampling)
             force_final = False
+            recovery_sampling = False
             if status == TURN_DONE:
                 break
             if status == TURN_ESC:
@@ -2386,6 +2633,11 @@ def main():
                 continue
             if status == TURN_STREAM_CUT:
                 malformed_stream_cuts += 1
+                recovery_sampling = True
+                continue
+            if status == TURN_GIBBERISH_CUT:
+                gibberish_cuts += 1
+                recovery_sampling = True
                 continue
             if status == TURN_FORCE_FINAL:
                 reasoning_loop_cuts += 1
@@ -2394,6 +2646,7 @@ def main():
             if status == TURN_TOOL:
                 reasoning_loop_cuts = 0
                 malformed_stream_cuts = 0
+                gibberish_cuts = 0
                 continue
         # Auto-save after the turn settles (whether it ended cleanly, hit the
         # step cap, or was escaped). This is the Hermes pattern: persist every
@@ -2495,14 +2748,117 @@ def _print_transcript(messages, max_chars=120):
     return printed
 
 
+def _session_list_page_options(args, default_limit=SESSION_LIST_DEFAULT_LIMIT):
+    """Parse paging flags and leave everything else as the search query."""
+    page = 1
+    limit = default_limit
+    query_parts = []
+    warnings = []
+    i = 0
+
+    def positive_int(value, fallback, name):
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            warnings.append(f"ignored invalid {name}: {value!r}")
+            return fallback
+        if n < 1:
+            warnings.append(f"ignored invalid {name}: {value!r}")
+            return fallback
+        return n
+
+    while i < len(args):
+        a = args[i]
+        if a in ("--page", "-p"):
+            if i + 1 >= len(args):
+                warnings.append(f"ignored missing value for {a}")
+                i += 1
+                continue
+            page = positive_int(args[i + 1], page, "page")
+            i += 2
+            continue
+        if a.startswith("--page="):
+            page = positive_int(a.split("=", 1)[1], page, "page")
+            i += 1
+            continue
+        if a in ("--limit", "-n"):
+            if i + 1 >= len(args):
+                warnings.append(f"ignored missing value for {a}")
+                i += 1
+                continue
+            limit = positive_int(args[i + 1], limit, "limit")
+            i += 2
+            continue
+        if a.startswith("--limit="):
+            limit = positive_int(a.split("=", 1)[1], limit, "limit")
+            i += 1
+            continue
+        query_parts.append(a)
+        i += 1
+
+    limit = max(1, min(limit, SESSION_LIST_MAX_LIMIT))
+    query = " ".join(query_parts).strip() or None
+    return query, page, limit, warnings
+
+
+def _print_session_list(sessions, start_index=1, current_id=None):
+    for offset, s in enumerate(sessions):
+        i = start_index + offset
+        title = s["title"] or "(empty)"
+        if current_id is not None:
+            mark = f"{GREEN}●{RESET}" if s["id"] == current_id else f"{DIM}{i:>3}{RESET}"
+            prefix = f"  {mark} "
+        else:
+            prefix = f"  {DIM}{i:>3}{RESET}  "
+        sid = s.get("id") or ""
+        print(f"{prefix}{MAGENTA}{sid}{RESET}  {title}")
+
+        meta = [f"{s['n']} msg", _fmt_when(s["updated_at"])]
+        if s.get("source"):
+            meta.append(f"source {s['source']}")
+        if s.get("model"):
+            meta.append(f"model {s['model']}")
+        cwd = _display_path(s.get("cwd"))
+        if cwd:
+            meta.append(f"cwd {cwd}")
+        print(f"       {DIM}{' · '.join(meta)}{RESET}")
+
+        detail = s.get("description")
+        label = "desc"
+        if not detail and s.get("preview"):
+            detail = s["preview"]
+            label = "first"
+        if detail:
+            print(f"       {DIM}{label}: {detail}{RESET}")
+
+
+def _session_next_hint(command, page, limit, query=None):
+    quoted_query = f" {shlex.quote(query)}" if query else ""
+    return f"{command}{quoted_query} --page {page + 1} --limit {limit}"
+
+
+def _display_path(path):
+    if not path:
+        return None
+    path = os.path.expanduser(str(path))
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
 def _cli_sessions(args):
     """`minion sessions [query]` — list saved sessions and exit (no REPL).
 
-    With no query: prints the ~20 most recent. With a query: substring-filters
-    (case-insensitive) across title, first-message preview, and id, so once
+    With no query: prints the first page of recent sessions. With a query:
+    substring-filters (case-insensitive) across title, description, preview,
+    and id, so once
     you have dozens of sessions you can narrow with e.g.
-    `minion sessions refactor`. Returns True if it handled a listing request
-    (caller should then exit); False if this wasn't a sessions invocation.
+    `minion sessions refactor`. Add `--page/-p` and `--limit/-n` to page
+    through the list. Returns True if it handled a listing request (caller
+    should then exit); False if this wasn't a sessions invocation.
 
     Deliberately a top-level verb rather than `--resume list`: "list" looks
     like it could be a session title, and a "resume" flag doing two different
@@ -2513,64 +2869,70 @@ def _cli_sessions(args):
         return False
     if args[0] not in ("sessions", "--sessions", "ls", "list"):
         return False
-    query = " ".join(args[1:]).strip() or None
-    sessions = _list_sessions(limit=50)
-    if query:
-        q = query.lower()
-        sessions = [s for s in sessions
-                    if q in (s.get("title") or "").lower()
-                    or q in (s.get("preview") or "").lower()
-                    or q in (s.get("id") or "").lower()]
+    query, page, limit, warnings = _session_list_page_options(args[1:])
+    offset = (page - 1) * limit
+    fetched = _list_sessions(limit=limit + 1, offset=offset, query=query)
+    sessions = fetched[:limit]
+    has_next = len(fetched) > limit
+    for warning in warnings:
+        print(f"{YELLOW}  {warning}{RESET}")
     if not sessions:
         if query:
-            print(f"  no sessions matching {query!r}")
+            print(f"  no sessions matching {query!r} on page {page}")
         else:
-            print(f"  no saved sessions yet  ({_sessions_dir()})")
+            if page > 1:
+                print(f"  no sessions on page {page}  ({_sessions_dir()})")
+            else:
+                print(f"  no saved sessions yet  ({_sessions_dir()})")
         return True
     where = f" matching {query!r}" if query else ""
-    print(f"{DIM}  sessions{where} — {_sessions_dir()}{RESET}")
-    for i, s in enumerate(sessions, 1):
-        title = s["title"] or "(empty)"
-        badge = ""
-        if s.get("source"):
-            badge = f"{DIM} · {s['source']}{RESET}"
-        print(f"  {DIM}{i:>3}{RESET}  {MAGENTA}{s.get('short', _short_id(s['id']))}{RESET}  "
-              f"{title}{DIM} · {s['n']} msg · "
-              f"{_fmt_when(s['updated_at'])}{badge}{RESET}")
-        # Prefer the live model-generated description (tracks the task);
-        # fall back to the first-message preview if there isn't one yet.
-        desc = s.get("description") or (s.get("preview") if s.get("preview") != title else None)
-        if desc:
-            print(f"       {DIM}{desc}{RESET}")
+    print(f"{DIM}  sessions{where} · page {page} · {_sessions_dir()}{RESET}")
+    _print_session_list(sessions, start_index=offset + 1)
     print(f"{DIM}  resume with: minion --resume <n|short-id|title>{RESET}")
+    if has_next:
+        print(f"{DIM}  next page: {_session_next_hint('minion sessions', page, limit, query)}{RESET}")
     return True
 
 
 def _cmd_sessions(user, current_id):
     """Handle /sessions [n] — list recent sessions, or show one in detail."""
-    parts = user.split(None, 1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    if not arg:
-        sessions = _list_sessions(limit=15)
+    parts = user.split()
+    args = parts[1:]
+    list_requested = not args or args[0] in ("--page", "-p", "--limit", "-n")
+    list_requested = list_requested or (args and (
+        args[0].startswith("--page=")
+        or args[0].startswith("--limit=")
+        or args[0] in ("page", "p")
+    ))
+    if list_requested:
+        page_args = args
+        if page_args and page_args[0] in ("page", "p"):
+            page_args = ["--page", *page_args[1:]]
+        query, page, limit, warnings = _session_list_page_options(page_args)
+        offset = (page - 1) * limit
+        fetched = _list_sessions(limit=limit + 1, offset=offset, query=query)
+        sessions = fetched[:limit]
+        has_next = len(fetched) > limit
+        for warning in warnings:
+            print(f"{YELLOW}  {warning}{RESET}")
         if not sessions:
-            print(f"{DIM}  no saved sessions yet (saved to {SESSION_HOME}/sessions){RESET}")
+            if query:
+                print(f"{DIM}  no sessions matching {query!r} on page {page}{RESET}")
+            elif page > 1:
+                print(f"{DIM}  no sessions on page {page} ({_sessions_dir()}){RESET}")
+            else:
+                print(f"{DIM}  no saved sessions yet (saved to {SESSION_HOME}/sessions){RESET}")
             return
-        print(f"{DIM}  recent sessions ({_sessions_dir()}):{RESET}")
-        for i, s in enumerate(sessions, 1):
-            mark = f"{GREEN}●{RESET}" if s["id"] == current_id else f"{DIM}{i:>2}{RESET}"
-            when = _fmt_when(s["updated_at"])
-            title = s["title"] or "(empty)"
-            extra = f" · {s['n']} msg"
-            if s.get("source"):
-                extra += f" · {s['source']}"
-            print(f"  {mark} {MAGENTA}{s.get('short', _short_id(s['id']))}{RESET}  "
-                  f"{title}{DIM}{extra} · {when}{RESET}")
-            desc = s.get("description") or (s.get("preview") if s.get("preview") != title else None)
-            if desc:
-                print(f"        {DIM}{desc}{RESET}")
+        where = f" matching {query!r}" if query else ""
+        print(f"{DIM}  recent sessions{where} · page {page} ({_sessions_dir()}):{RESET}")
+        _print_session_list(sessions, start_index=offset + 1, current_id=current_id)
         print(f"{DIM}  /resume <n|short-id|title> to switch · /delete <n|id> to remove{RESET}")
+        if has_next:
+            query_tail = f" {shlex.quote(query)}" if query else ""
+            print(f"{DIM}  next page: /sessions --page {page + 1} --limit {limit}{query_tail}{RESET}")
         return
     # /sessions <target> — show detail for one session
+    arg = " ".join(args).strip()
     sessions = _list_sessions(limit=50)
     sid = _resolve_session(arg, sessions)
     if not sid:

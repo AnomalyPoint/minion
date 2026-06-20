@@ -102,6 +102,9 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_REASONING_LOOP_SIGNALS` | threshold for the reasoning-loop guard (default 10; `0` disables) |
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 12000; `0` disables) |
 | `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
+| `MINION_REASONING_GIBBERISH_CHARS` | rolling reasoning window for numeric/markup noise detection (default 600; `0` disables) |
+| `MINION_REASONING_GIBBERISH_RETRIES` | recovery attempts after reasoning noise is detected (default 1) |
+| `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | sampler params used only for malformed/gibberish recovery retries (defaults `0.2` / `0.95`; negative values omit them) |
 | `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 1024) |
 | `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 8192; `0` omits the cap) |
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
@@ -113,7 +116,8 @@ so per-user settings live in one place instead of being exported every shell.
 | subcommand          | what it does                                          |
 | ------------------- | ---------------------------------------------------- |
 | `minion`            | start the REPL                                        |
-| `minion sessions [query]` | list saved sessions (prints + exits); optional substring filter |
+| `minion sessions [query]` | list saved sessions, 10 per page (prints + exits); optional substring filter |
+| `minion --sessions [query]` | alias for `minion sessions [query]` |
 
 ## Commands
 
@@ -225,14 +229,20 @@ human-readable/greppable.
 - **Discover** saved sessions from the shell with `minion sessions` (prints
   and exits — no REPL). Add a substring query to filter:
   `minion sessions refactor` matches titles, descriptions, and ids.
+  Listings show 10 sessions per page by default. Use `--page/-p` and
+  `--limit/-n` to move through older sessions without loading every transcript.
 - A resumed session **reselects the source** (endpoint + model) it was started
   on, so it lands on the same backend it was talking to.
 - `/sessions <n>` shows the full transcript of a past session inline.
+- Use `/sessions --page 2` for the next in-chat page. `/sessions 2` still
+  opens session 2, so numeric selection keeps working.
 - `/reset` starts a fresh session (it does not overwrite the old one).
 
 ```
-$ minion sessions              # browse recent sessions, then exit
-$ minion sessions refactor     # filter to sessions mentioning "refactor"
+$ minion sessions              # browse the 10 most recent sessions, then exit
+$ minion sessions --page 2     # browse the next page
+$ minion sessions -n 5 -p 3    # page 3, 5 sessions per page
+$ minion sessions refactor     # filter sessions mentioning "refactor"
 $ minion --resume 1            # resume the most recent session
 $ minion --resume deadbe       # resume by short id
 $ minion --resume implement    # resume the session titled "implement…"
@@ -243,7 +253,7 @@ how Hermes (`hermes_state.py`) stores sessions, but flat JSON files instead of
 SQLite, since minion is a single local agent rather than a multi-platform
 gateway.
 
-## Reasoning-loop guard
+## Reasoning recovery guards
 
 Reasoning models sometimes spin in place — they keep saying "let me implement…"
 without actually doing anything. minion counts those "ready to act" phrases
@@ -251,6 +261,13 @@ during the reasoning phase and, after `MINION_REASONING_LOOP_SIGNALS` (default
 **10**) of them, cuts the stream and nudges the model to take a concrete action.
 Set the env var to `0` to disable, or lower it (e.g. `5`) for a more aggressive
 cut.
+
+minion also watches reasoning-only output for dense numeric/markup noise before
+any visible answer or tool call exists. If that trips, the partial assistant turn
+is discarded and the next retry uses recovery sampler params
+(`MINION_RECOVERY_TEMPERATURE=0.2`, `MINION_RECOVERY_TOP_P=0.95` by default).
+Normal turns do not pass sampler params, so llama.cpp or the active API keeps its
+own defaults unless a recovery retry is in progress.
 
 ## Tools
 
@@ -287,3 +304,7 @@ minion was developed using the following models:
 - **minion** (eating its own dog food)
 - [**GLM 5.2**](https://huggingface.co/zai-org/GLM-5.2) (Z.ai, open weights)
 - [**MiniMax-M3**](https://huggingface.co/MiniMaxAI/MiniMax-M3) (MiniMax)
+
+## License
+
+MIT License. See [`LICENSE`](LICENSE).

@@ -120,3 +120,49 @@ def test_risk_classifier_retries_connection_failures():
             m.RISK_CONNECTION_RETRIES,
             m.RISK_CONNECTION_RETRY_SECONDS,
         ) = saved
+
+
+def test_open_stream_only_sets_sampler_params_for_recovery():
+    m = reload_minion()
+    saved = (
+        m.client,
+        m._log_event,
+        m._llog,
+        m.RECOVERY_TEMPERATURE,
+        m.RECOVERY_TOP_P,
+    )
+    calls = []
+
+    class Resp:
+        def __iter__(self):
+            return iter(())
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return Resp()
+
+    try:
+        m.RECOVERY_TEMPERATURE = 0.2
+        m.RECOVERY_TOP_P = 0.95
+        m._log_event = lambda *_: None
+        m._llog = None
+        m.client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create)))
+
+        m.open_stream([{"role": "user", "content": "normal"}])
+        m.open_stream([{"role": "user", "content": "recover"}],
+                      recovery_sampling=True)
+
+        assert "temperature" not in calls[0]
+        assert "top_p" not in calls[0]
+        assert calls[1]["temperature"] == 0.2
+        assert calls[1]["top_p"] == 0.95
+    finally:
+        (
+            m.client,
+            m._log_event,
+            m._llog,
+            m.RECOVERY_TEMPERATURE,
+            m.RECOVERY_TOP_P,
+        ) = saved
