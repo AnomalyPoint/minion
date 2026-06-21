@@ -35,7 +35,7 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name]  /yolo  /approval [level]  /compress  /compact  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
 """
@@ -879,9 +879,35 @@ def _interrupt_watcher():
 
 
 # --- tools ------------------------------------------------------------------
-def read_file(path, **_):
+def read_file(path, offset=1, limit=None, **_):
+    """Read a file as numbered lines (1-based, `cat -n` style: right-aligned
+    line number, a tab, then the line). Large files return only a window — pass
+    offset (start line) and limit (max lines) to page through the rest. A header
+    announces the visible range + total line count so the model can ask for more
+    instead of being head/tail-capped by _sanitize_tool_result."""
     with open(path) as f:
-        return f.read()
+        lines = f.readlines()
+    total = len(lines)
+    try:
+        start = max(1, int(offset)) - 1
+    except (TypeError, ValueError):
+        start = 0
+    if total and start >= total:
+        return f"[{path}: {total} lines; offset {start + 1} is past end of file]"
+    if limit is None:
+        limit = _env_int("MINION_READ_FILE_LINES", 400)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 400
+    end = total if limit <= 0 else min(total, start + limit)
+    body = "".join(f"{i + 1:6d}\t{lines[i]}" for i in range(start, end))
+    if body and not body.endswith("\n"):
+        body += "\n"
+    if start > 0 or end < total:
+        return (f"[{path}: lines {start + 1}-{end} of {total}; "
+                f"call read_file with offset/limit to page]\n" + body)
+    return body
 
 
 def write_file(path, content, **_):
@@ -892,9 +918,33 @@ def write_file(path, content, **_):
     return f"wrote {len(content)} bytes to {path}"
 
 
+_LINE_NUM_PREFIX = re.compile(r"^ *\d+\t")
+
+
+def _strip_line_numbers(text):
+    """Remove read_file's `<n>\\t` line-number prefixes from a pasted block.
+    Only strips when EVERY non-empty line carries one (i.e. the whole block came
+    from numbered read_file output) — so ordinary edits, and code that merely
+    starts a line with digits, are never altered."""
+    lines = text.split("\n")
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty and all(_LINE_NUM_PREFIX.match(ln) for ln in nonempty):
+        return "\n".join(_LINE_NUM_PREFIX.sub("", ln) for ln in lines)
+    return text
+
+
 def edit_file(path, old, new, **_):
     with open(path) as f:
         src = f.read()
+    if src.count(old) != 1:
+        # The model may have pasted read_file's numbered output into `old`.
+        # Only as a fallback (exact match already failed), retry with the
+        # numbering stripped — and strip `new` the same way so we never write
+        # line numbers into the file. Normal edits hit the exact match above
+        # and never reach here, so genuine content is never touched.
+        stripped_old = _strip_line_numbers(old)
+        if stripped_old != old and src.count(stripped_old) == 1:
+            old, new = stripped_old, _strip_line_numbers(new)
     if src.count(old) != 1:
         return f"ERROR: `old` matched {src.count(old)} times (need exactly 1)"
     if not _confirm(f"edit {path}"):
@@ -924,11 +974,11 @@ DISPATCH = {
 }
 
 TOOLS = [
-    {"type": "function", "function": {"name": "read_file", "description": "Read a file's contents",
-        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a file's contents. Returns lines numbered (1-based, like `cat -n`: a right-aligned number, a tab, then the line). Large files return only a window — pass `offset` (1-based start line) and `limit` (max lines, default 400) to page through the rest; a header shows the visible range and total line count.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "description": "1-based line to start from (default 1)"}, "limit": {"type": "integer", "description": "max lines to return (default 400; <=0 reads to end)"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "write_file", "description": "Write (overwrite) a file",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "edit_file", "description": "Replace one exact occurrence of `old` with `new` in a file",
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace one exact occurrence of `old` with `new` in a file. Prefer raw file text; if you paste read_file's numbered lines, the `<n>\\t` line-number prefixes are stripped automatically.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
     {"type": "function", "function": {"name": "list_dir", "description": "List a directory",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
@@ -1009,20 +1059,7 @@ def _precise_abbr(n):
         return f"{n / 1_000_000:.2f}M"
     return f"{n // 1_000_000_000}B"
 
-REASONING_LOOP_SIGNALS = (
-    "start coding",
-    "let me implement",
-    "let's implement",
-    "now implement",
-    "i'll implement",
-    "i will implement",
-    "write the code",
-    "let me write",
-    "start with the code",
-)
-REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
 REASONING_ONLY_CHAR_LIMIT = _env_int("MINION_REASONING_ONLY_CHARS", 36000)
-REASONING_GIBBERISH_CHARS = _env_int("MINION_REASONING_GIBBERISH_CHARS", 600)
 MAX_COMPLETION_TOKENS = _env_int("MINION_MAX_TOKENS", 16000)
 # Cap + dedup tool results before they enter the message history. Large,
 # near-duplicate tool outputs (find/ls/grep path dumps) are the fuel for the
@@ -1047,9 +1084,6 @@ RECOVERY_DRY_ALLOWED_LENGTH = _env_int("MINION_RECOVERY_DRY_ALLOWED_LENGTH", 2)
 # Treat path/code punctuation as DRY sequence breakers so a long file path the
 # agent must emit verbatim is never penalized as "repetition".
 RECOVERY_DRY_SEQUENCE_BREAKERS = ["\n", ":", "\"", "*", "/", "\\", "`", "'"]
-# Cut the stream when the model leaks GLM-native control markers it should never
-# emit (the </arg_value> / <arg_key> salad in the gibberish reports). 0 disables.
-LEAK_TOKEN_GUARD = _env_int("MINION_LEAK_TOKEN_GUARD", 1)
 RISK_CONNECTION_RETRIES = _env_int("MINION_RISK_RETRIES", 3)
 RISK_CONNECTION_RETRY_SECONDS = _env_int("MINION_RISK_RETRY_SECONDS", 1)
 # Resolved here (not at the sessions-section top) because _env_int() is
@@ -1062,22 +1096,7 @@ DESC_SYSTEM = (
     "current task, key files, or goal. No preamble, no quotes, no trailing "
     "punctuation. Write in the same language as the conversation."
 )
-REASONING_LOOP_NUDGES = (
-    "You are looping in reasoning after repeatedly deciding to start implementation. "
-    "Stop planning now. Take the next concrete action: either call the appropriate tool "
-    "or give the final answer. Do not continue private reasoning.",
-    "The previous runtime nudge did not work. Your next assistant turn must contain "
-    "exactly one concrete action: either a tool call or the final answer. Do not "
-    "explain, plan, or continue reasoning. If you need file context, call read_file "
-    "or list_dir now.",
-    "Hard stop. Emit only a tool call now. If native tool calls are unavailable, "
-    "emit exactly one <tool_call>{...}</tool_call> block and nothing else. For code "
-    "edits, read the target file first unless you already know the exact replacement.",
-)
-REASONING_LOOP_RETRY_LIMIT = _env_int(
-    "MINION_REASONING_LOOP_RETRIES", len(REASONING_LOOP_NUDGES))
 REASONING_ONLY_RETRY_LIMIT = _env_int("MINION_REASONING_ONLY_RETRIES", 1)
-REASONING_GIBBERISH_RETRY_LIMIT = _env_int("MINION_REASONING_GIBBERISH_RETRIES", 1)
 MALFORMED_STREAM_RETRY_LIMIT = _env_int("MINION_MALFORMED_STREAM_RETRIES", 2)
 FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
@@ -1087,19 +1106,6 @@ FORCED_FINAL_NUDGE = (
     "private reasoning. Use the final_answer tool if available. Return a complete "
     "visible answer now in at most six short bullets or paragraphs. If you are "
     "blocked, say exactly what is blocking you and what input is needed."
-)
-GIBBERISH_RECOVERY_NUDGE = (
-    "Your previous reasoning stream became unreadable token noise. Discard that "
-    "broken reasoning completely. Do not rephrase it or continue from any corrupted "
-    "tokens. Continue from the last valid tool result or visible user instruction "
-    "with exactly one concrete action: a valid tool call or a concise visible answer."
-)
-GIBBERISH_CHECKPOINT_NUDGE = (
-    "Repeated reasoning recovery failed. Do not continue private reasoning and do "
-    "not attempt another tool call except final_answer. Return a bounded visible checkpoint for the "
-    "user with: (1) the last valid result you can rely on, (2) the next concrete "
-    "action you would take, and (3) any blocker or uncertainty. Keep it to at most "
-    "six short bullets or paragraphs."
 )
 MANUAL_RECOVERY_NUDGE = (
     "Manual recovery requested by the user because the previous response appeared "
@@ -1639,168 +1645,6 @@ class _LoggingStream:
                 pass
 
 
-class _ReasoningLoopSignalCounter:
-    """Counts repeated "ready to act" phrases across streamed reasoning chunks."""
-    def __init__(self, phrases):
-        self.phrases = tuple(p.lower() for p in phrases)
-        self.tail = ""
-        self.hits = 0
-        self.max_phrase_len = max((len(p) for p in self.phrases), default=1)
-
-    def feed(self, chunk):
-        if not self.phrases:
-            return self.hits
-        old_len = len(self.tail)
-        text = self.tail + chunk.lower()
-        scan_start = max(0, old_len - self.max_phrase_len + 1)
-        for phrase in self.phrases:
-            start = text.find(phrase, scan_start)
-            while start != -1:
-                if start + len(phrase) > old_len:
-                    self.hits += 1
-                start = text.find(phrase, start + 1)
-        self.tail = text[-(self.max_phrase_len - 1):]
-        return self.hits
-
-
-# GLM-native chat-template control markers that minion's own protocol never
-# emits. When the model leaks these as literal output the decode has almost
-# certainly collapsed — they were prominent in the observed gibberish.
-# Deliberately excludes <think>/<tool_call> (legit reasoning / text tool-call
-# protocol). Two tiers, because file *content* travels through tool args:
-#   STRICT = model-internal specials that never appear in real code/text — safe
-#            to trip on a single hit, even inside tool-call args.
-#   BROAD  = STRICT plus GLM's <arg_key>/<arg_value> XML, which CAN legitimately
-#            appear in a chat-template file someone is editing; only used on the
-#            reasoning/content channels (which never carry written file bodies),
-#            and only with min_hits>=2 to spare incidental mentions in prose.
-_LEAK_TOKEN_STRICT_RE = re.compile(r"<\|[A-Za-z0-9_]{1,32}\|>|\[s?g?MASK\]|</?sop>|</?eop>")
-_LEAK_TOKEN_BROAD_RE = re.compile(
-    r"</?arg_(?:key|value)\s*>|<\|[A-Za-z0-9_]{1,32}\|>|\[s?g?MASK\]|</?sop>|</?eop>")
-
-
-def _leak_token_hit(text, min_hits=1, strict=False):
-    """Return the leaked marker string if `text` contains >= min_hits control
-    markers, else None. strict=True restricts to model-internal specials that are
-    never valid in file content (use on tool-call args)."""
-    if not LEAK_TOKEN_GUARD or not text:
-        return None
-    rx = _LEAK_TOKEN_STRICT_RE if strict else _LEAK_TOKEN_BROAD_RE
-    hits = rx.findall(text)
-    if len(hits) >= min_hits:
-        return hits[0]
-    return None
-
-
-def _reasoning_gibberish_reason(sample):
-    """Return a short reason when reasoning text has collapsed into junk.
-
-    This intentionally targets observed failure modes: dense numeric/markup
-    noise, or repetitive low-information scaffolding in reasoning_content
-    before the model emits content or a tool call. It is not a general
-    "weird text" filter.
-    """
-    sample = sample.strip()
-    n = len(sample)
-    if n < 180:
-        return None
-
-    whitespace_ratio = sum(c.isspace() for c in sample) / n
-    digit_ratio = sum(c.isdigit() for c in sample) / n
-    alpha_ratio = sum(c.isalpha() for c in sample) / n
-    punct_ratio = sum((not c.isalnum() and not c.isspace()) for c in sample) / n
-    markup_hits = len(re.findall(
-        r"(?:</|<a\b|div|span|href|class|svg|var)\w*", sample, re.I))
-
-    score = 0
-    reasons = []
-    if digit_ratio > 0.65 and whitespace_ratio < 0.10:
-        score += 3
-        reasons.append("mostly digits")
-    elif digit_ratio > 0.42 and whitespace_ratio < 0.08:
-        score += 2
-        reasons.append("dense digits")
-    if re.search(r"\d{28,}", sample):
-        score += 1
-        reasons.append("long numeric run")
-    if markup_hits >= 10 and whitespace_ratio < 0.12:
-        score += 2
-        reasons.append("markup fragments")
-    elif markup_hits >= 16:
-        score += 1
-        reasons.append("many markup fragments")
-    if re.search(r"\b([A-Za-z]{2,8})\1{2,}\b", sample):
-        score += 1
-        reasons.append("repeated fragments")
-    if whitespace_ratio < 0.06 and punct_ratio > 0.10 and alpha_ratio < 0.38:
-        score += 1
-        reasons.append("compact symbol soup")
-
-    tokens = re.findall(r"[A-Za-z']+|\d+|//|[`*_{}\"'-]{1,3}", sample.lower())
-    if len(tokens) >= 40:
-        counts = {}
-        for tok in tokens:
-            counts[tok] = counts.get(tok, 0) + 1
-        ranked = sorted(counts.values(), reverse=True)
-        unique_ratio = len(counts) / len(tokens)
-        top_ratio = max(counts.values()) / len(tokens)
-        top5_ratio = sum(ranked[:5]) / len(tokens)
-        short_ratio = sum(len(tok) <= 4 for tok in tokens) / len(tokens)
-        numeric_token_ratio = sum(tok.isdigit() for tok in tokens) / len(tokens)
-        symbol_token_ratio = sum(
-            bool(re.fullmatch(r"//|[`*_{}\"'-]{1,3}", tok))
-            for tok in tokens
-        ) / len(tokens)
-        low_info = {
-            "`", "``", "```", "*", "**", "***", "_", "__", "___", "//",
-            "a", "i", "it", "me", "my", "so", "the", "to", "you",
-            "your", "you're", "as", "and", "or", "of", "in", "on",
-        }
-        layoutish = {
-            "arg", "args", "bottom", "command", "cwd", "focus", "home",
-            "layout", "left", "name", "pane", "right", "size", "split",
-            "start", "tab", "top",
-        }
-        low_info_ratio = sum(
-            tok in low_info or tok.isdigit()
-            for tok in tokens
-        ) / len(tokens)
-        layoutish_ratio = sum(tok in layoutish for tok in tokens) / len(tokens)
-        if unique_ratio < 0.24 and short_ratio > 0.72 and top_ratio > 0.10:
-            score += 2
-            reasons.append("repeated short fragments")
-        if unique_ratio < 0.36 and low_info_ratio > 0.62:
-            score += 2
-            reasons.append("low-information repetition")
-        if (unique_ratio < 0.34 and top5_ratio > 0.55
-                and numeric_token_ratio + symbol_token_ratio > 0.28):
-            score += 2
-            reasons.append("dominant token loop")
-        if (layoutish_ratio > 0.28 and top5_ratio > 0.48
-                and numeric_token_ratio + symbol_token_ratio > 0.22):
-            score += 2
-            reasons.append("layout-token repetition")
-
-    if score >= 3:
-        return ", ".join(reasons[:2]) or "unreadable reasoning"
-    return None
-
-
-class _ReasoningGibberishDetector:
-    def __init__(self, window):
-        self.window = max(0, int(window))
-        self.buf = ""
-        self.min_chars = min(240, self.window) if self.window else 0
-
-    def feed(self, chunk):
-        if not self.window:
-            return None
-        self.buf = (self.buf + chunk)[-self.window:]
-        if len(self.buf) < self.min_chars:
-            return None
-        return _reasoning_gibberish_reason(self.buf)
-
-
 def _tool_call_progress(tcs):
     parts = []
     for i in sorted(tcs):
@@ -1813,16 +1657,14 @@ def _tool_call_progress(tcs):
 
 TURN_DONE = "done"
 TURN_TOOL = "tool"
-TURN_LOOP_CUT = "loop_cut"
 TURN_STREAM_CUT = "stream_cut"
-TURN_GIBBERISH_CUT = "gibberish_cut"
 TURN_FORCE_FINAL = "force_final"
 TURN_ESC = "esc"  # user pressed Esc at an approval prompt → drop to chat input
 
 
 # --- one model turn (streamed), returns TURN_* status -----------------------
 def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
-               gibberish_cut_count=0, forced_final=False, recovery_sampling=False):
+               forced_final=False, recovery_sampling=False):
     # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
     # watcher-setup window (which can be tens of ms on a warm local server but
     # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
@@ -1872,13 +1714,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     timings = None
     usage = None
     t_first = None   # time of first output token (for TTFT)
-    loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
-    gibberish = _ReasoningGibberishDetector(REASONING_GIBBERISH_CHARS)
-    content_tail = ""  # rolling tail of streamed content, for leak-token detection
-    args_tail = ""     # rolling tail of streamed tool-call args, same purpose
     loop_cut = False
-    loop_cut_reason = "signals"
-    gibberish_reason = None
     reasoning_only_chars = 0
     stream_error = None
     interrupted = False
@@ -1954,71 +1790,12 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
             # run straight into the answer).
             rc = getattr(d, "reasoning_content", None) or (d.model_extra or {}).get("reasoning_content")
             if rc:
-                if not content and not tcs and REASONING_GIBBERISH_CHARS > 0:
-                    gibberish_reason = gibberish.feed(rc)
-                    # leaked GLM control markers in the reasoning window are a
-                    # high-signal collapse tell the ratio heuristic can miss
-                    if not gibberish_reason:
-                        leak = _leak_token_hit(gibberish.buf, min_hits=2)
-                        if leak:
-                            gibberish_reason = f"leaked control token {leak!r}"
-                    if gibberish_reason:
-                        if mode == "think":
-                            print()
-                        print(f"{RED}  ⚠ REASONING GIBBERISH DETECTED — "
-                              f"{gibberish_reason}; cutting stream now{RESET}")
-                        loop_cut = True
-                        loop_cut_reason = "gibberish"
-                        close = getattr(stream, "close", None)
-                        if close:
-                            close()
-                        break
                 if mode != "think":
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
                 print(f"{DIM}{rc}{RESET}", end="", flush=True)
                 if not content and not tcs:
                     reasoning_only_chars += len(rc)
-                if REASONING_LOOP_SIGNAL_LIMIT > 0 and not content and not tcs:
-                    prev_hits = loop_signals.hits
-                    hits = loop_signals.feed(rc)
-                    # Print a loud, obvious counter on threshold crossings so the
-                    # user can see the model spiraling before it gets cut. We
-                    # fire at the first hit, then at 25/50/75/100% of the limit
-                    # (clamped so milestones never exceed the limit). Keeps the
-                    # noise down to ≤5 lines per turn while still being impossible
-                    # to miss in the dim reasoning stream.
-                    _limit = REASONING_LOOP_SIGNAL_LIMIT
-                    _milestones = sorted(set(min(_limit, v) for v in (
-                        1,                                       # first hit
-                        (_limit + 3) // 4,                       # 25%
-                        (_limit + 1) // 2,                       # 50%
-                        (3 * _limit + 3) // 4,                   # 75%
-                        _limit,                                  # 100% — the cut itself
-                    ) if 0 < v <= _limit))
-                    crossed_milestones = [m for m in _milestones if prev_hits < m <= hits]
-                    for milestone in crossed_milestones:
-                        # Break out of the dim inline stream so the warning
-                        # lands on its own line, then reopen reasoning mode
-                        # below so subsequent chunks (if any) keep streaming
-                        # cleanly. The end-of-loop divider in the finally-ish
-                        # block below will close it out properly when we break.
-                        print()
-                        if milestone >= _limit:
-                            print(f"{RED}  ⚠ REASONING LOOP LIMIT HIT — {hits}/{_limit} ready-to-act signals "
-                                  f"(“{loop_signals.phrases[0]}”, etc.) — cutting stream now{RESET}")
-                        else:
-                            pct = (milestone * 100) // _limit if _limit else 0
-                            print(f"{YELLOW}  ⚠ REASONING LOOP WARNING — {milestone}/{_limit} ready-to-act signals "
-                                  f"({pct}% of cut threshold); model keeps re-deciding to start coding{RESET}")
-                        print(f"{DIM}  ── reasoning ──{RESET}")
-                    if hits >= REASONING_LOOP_SIGNAL_LIMIT:
-                        loop_cut = True
-                        loop_cut_reason = "signals"
-                        close = getattr(stream, "close", None)
-                        if close:
-                            close()
-                        break
                 if (REASONING_ONLY_CHAR_LIMIT > 0 and not content and not tcs
                         and reasoning_only_chars >= REASONING_ONLY_CHAR_LIMIT):
                     print()
@@ -2026,7 +1803,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                           f"{_abbr(reasoning_only_chars)} reasoning chars with no "
                           f"answer/tool call — cutting stream now{RESET}")
                     loop_cut = True
-                    loop_cut_reason = "reasoning_only"
                     close = getattr(stream, "close", None)
                     if close:
                         close()
@@ -2042,21 +1818,6 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                 mode = "say"
                 print(d.content, end="", flush=True)
                 content.append(d.content)
-                # leaked GLM control markers in visible output → collapse (the
-                # ratio heuristic only watches the reasoning channel)
-                content_tail = (content_tail + d.content)[-512:]
-                leak = _leak_token_hit(content_tail, min_hits=2)
-                if leak:
-                    print()  # close the green content line
-                    print(f"{RED}  ⚠ OUTPUT GIBBERISH DETECTED — leaked control "
-                          f"token {leak!r}; cutting stream now{RESET}")
-                    loop_cut = True
-                    loop_cut_reason = "gibberish"
-                    gibberish_reason = f"leaked control token {leak!r}"
-                    close = getattr(stream, "close", None)
-                    if close:
-                        close()
-                    break
             for tc in (d.tool_calls or []):
                 # if we were mid-reasoning when tools kicked in, close it out so
                 # the cyan tool box (which starts with its own \n) gets a clean line
@@ -2074,24 +1835,7 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
                     s["name"] = tc.function.name
                 if tc.function and tc.function.arguments:
                     s["args"] += tc.function.arguments
-                    # GLM <arg_key>/<arg_value>/pipe-specials are never valid
-                    # JSON tool args — one occurrence is enough to call collapse
-                    if not loop_cut:
-                        args_tail = (args_tail + tc.function.arguments)[-512:]
-                        leak = _leak_token_hit(args_tail, min_hits=1, strict=True)
-                        if leak:
-                            loop_cut = True
-                            loop_cut_reason = "gibberish"
-                            gibberish_reason = f"leaked control token {leak!r} in tool args"
                 show_tool_status()
-            if loop_cut:  # tool-args collapse detected above
-                clear_tool_status()
-                print(f"\n{RED}  ⚠ TOOL-CALL GIBBERISH DETECTED — "
-                      f"{gibberish_reason}; cutting stream now{RESET}")
-                close = getattr(stream, "close", None)
-                if close:
-                    close()
-                break
     except (APIError, APIConnectionError, httpx.HTTPError) as e:
         stream_error = e
         close = getattr(stream, "close", None)
@@ -2155,66 +1899,28 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
 
     if not loop_cut and not text.strip() and not tcs and reasoning_only_chars > 0:
         loop_cut = True
-        loop_cut_reason = "reasoning_only"
 
     if loop_cut:
-        if loop_cut_reason == "reasoning_only":
-            retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
-            cut_count = reasoning_loop_cut_count
-            loop_detail = (
-                f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls")
-        elif loop_cut_reason == "gibberish":
-            retry_limit = max(0, REASONING_GIBBERISH_RETRY_LIMIT)
-            cut_count = gibberish_cut_count
-            loop_detail = f"unreadable reasoning noise ({gibberish_reason or 'detected'})"
-        else:
-            retry_limit = max(0, REASONING_LOOP_RETRY_LIMIT)
-            cut_count = reasoning_loop_cut_count
-            loop_detail = f"{loop_signals.hits} ready-to-act signals"
+        retry_limit = max(0, REASONING_ONLY_RETRY_LIMIT)
+        cut_count = reasoning_loop_cut_count
+        loop_detail = (
+            f"{_abbr(reasoning_only_chars)} reasoning chars without content/tool calls")
         if forced_final:
             print(f"{RED}  ✂ FORCED FINAL ANSWER FAILED — got {loop_detail}; "
                   f"returning to chat input{RESET}")
             return TURN_DONE
         if cut_count >= retry_limit:
-            if loop_cut_reason == "reasoning_only":
-                print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
-                      f"{cut_count} forced final "
-                      f"attempt{'s' if cut_count != 1 else ''} "
-                      f"× {loop_detail}; waiting for user input{RESET}")
-            elif loop_cut_reason == "gibberish":
-                print(f"{YELLOW}  ✂ REASONING GIBBERISH RECOVERY FAILED — "
-                      f"{cut_count} recover"
-                      f"{'ies' if cut_count != 1 else 'y'} × {loop_detail}; "
-                      f"forcing visible checkpoint{RESET}")
-                _nudge_current_user_turn(messages, GIBBERISH_CHECKPOINT_NUDGE)
-                return TURN_FORCE_FINAL
-            else:
-                print(f"{RED}  ✂ REASONING LOOP MAX RETRIES HIT — gave up after "
-                      f"{cut_count} cut{'s' if cut_count != 1 else ''} "
-                      f"× {loop_detail}; "
-                      f"waiting for user input{RESET}")
+            print(f"{RED}  ✂ REASONING-ONLY RESCUE FAILED — gave up after "
+                  f"{cut_count} forced final "
+                  f"attempt{'s' if cut_count != 1 else ''} "
+                  f"× {loop_detail}; waiting for user input{RESET}")
             return TURN_DONE
-        if loop_cut_reason == "signals":
-            nudge = REASONING_LOOP_NUDGES[
-                min(cut_count, len(REASONING_LOOP_NUDGES) - 1)]
-            cut_msg = (f"{loop_signals.hits} ready-to-act signals "
-                       f"(limit {REASONING_LOOP_SIGNAL_LIMIT})")
-            print(f"{YELLOW}  ✂ REASONING LOOP CUT — {cut_msg}; nudging implementation "
-                  f"(retry {cut_count + 1}/{retry_limit}){RESET}")
-            _nudge_current_user_turn(messages, nudge)
-            return TURN_LOOP_CUT
-        if loop_cut_reason == "reasoning_only":
-            cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
-                       f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
-            print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
-                  f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
-            _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
-            return TURN_FORCE_FINAL
-        print(f"{YELLOW}  ✂ REASONING GIBBERISH CUT — {loop_detail}; "
-              f"retrying with recovery sampling "
+        cut_msg = (f"{_abbr(reasoning_only_chars)} reasoning chars with no "
+                   f"answer/tool call (limit {_abbr(REASONING_ONLY_CHAR_LIMIT)})")
+        print(f"{YELLOW}  ✂ REASONING-ONLY STALL — {cut_msg}; forcing final answer "
               f"(attempt {cut_count + 1}/{retry_limit}){RESET}")
-        _nudge_current_user_turn(messages, GIBBERISH_RECOVERY_NUDGE)
-        return TURN_GIBBERISH_CUT
+        _nudge_current_user_turn(messages, FORCED_FINAL_NUDGE)
+        return TURN_FORCE_FINAL
 
     # stats footer — prefer llama.cpp timings if present; otherwise fall back
     # to the standard streaming `usage` object (OpenAI, Z.ai, etc.); otherwise
@@ -2375,10 +2081,9 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
     steps = 0
     reasoning_loop_cuts = 0
     malformed_stream_cuts = 0
-    gibberish_cuts = 0
     while steps < 25:  # cap runaway tool/retry loops
         status = model_turn(messages, reasoning_loop_cuts, malformed_stream_cuts,
-                            gibberish_cuts, forced_final=force_final,
+                            forced_final=force_final,
                             recovery_sampling=recovery_sampling)
         force_final = False
         recovery_sampling = False
@@ -2387,15 +2092,8 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
         if status == TURN_ESC:
             break  # user pressed Esc at an approval → drop to chat input
         steps += 1
-        if status == TURN_LOOP_CUT:
-            reasoning_loop_cuts += 1
-            continue
         if status == TURN_STREAM_CUT:
             malformed_stream_cuts += 1
-            recovery_sampling = True
-            continue
-        if status == TURN_GIBBERISH_CUT:
-            gibberish_cuts += 1
             recovery_sampling = True
             continue
         if status == TURN_FORCE_FINAL:
@@ -2406,7 +2104,6 @@ def _run_model_turn_loop(messages, force_final=False, recovery_sampling=False):
         if status == TURN_TOOL:
             reasoning_loop_cuts = 0
             malformed_stream_cuts = 0
-            gibberish_cuts = 0
             continue
 
 
@@ -2862,7 +2559,7 @@ def main():
             else:
                 print(f"{YELLOW}  unknown level {arg!r} — want all|low|medium|high|yolo{RESET}")
             continue
-        if user == "/reset":
+        if user in ("/reset", "/clear", "/new"):
             messages = [{"role": "system", "content": SYSTEM}]
             print(f"{DIM}  context cleared{RESET}")
             # A reset forks a new session id so the fresh chat isn't written

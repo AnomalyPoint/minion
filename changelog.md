@@ -2,6 +2,55 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — `/clear` and `/new` aliases for `/reset`
+`/clear` and `/new` now do the same thing as `/reset`: clear the in-memory
+context down to the system prompt and fork a fresh session id (so the old
+chat is preserved on disk rather than overwritten). Mirrors the
+`/compact` → `/compress` alias pattern.
+
+### Removed — in-stream reasoning heuristics (signal counter, gibberish detector, leak-token guard)
+The model was fixed, so the heuristic guards that papered over its failure modes
+were removed (~340 LOC, ~10%). They were content-quality guesses that misfired
+on legitimate reasoning, so with the underlying problem gone they were net
+negative.
+
+Removed entirely:
+- `_reasoning_gibberish_reason` + `_ReasoningGibberishDetector` — the
+  numeric/markup/short-token/layout-loop noise scorer and its rolling-window
+  wrapper. `TURN_GIBBERISH_CUT`, `REASONING_GIBBERISH_CHARS`,
+  `REASONING_GIBBERISH_RETRY_LIMIT`, `GIBBERISH_RECOVERY_NUDGE`,
+  `GIBBERISH_CHECKPOINT_NUDGE` all gone.
+- `_ReasoningLoopSignalCounter` + `REASONING_LOOP_SIGNALS` /
+  `REASONING_LOOP_SIGNAL_LIMIT` — the "ready to act" phrase counter and its
+  milestone printing. `TURN_LOOP_CUT`, `REASONING_LOOP_NUDGES`,
+  `REASONING_LOOP_RETRY_LIMIT` gone.
+- `_leak_token_hit` + `_LEAK_TOKEN_STRICT_RE` / `_LEAK_TOKEN_BROAD_RE` +
+  `LEAK_TOKEN_GUARD` — the GLM `<|…|>` / mask-token leak detector on reasoning,
+  content, and tool-args tails. `content_tail` / `args_tail` rolling buffers gone.
+- The `gibberish` / `signals` / `gibberish_cut_count` branches of the cut
+  handler and `_run_model_turn_loop`. The cut handler is now a single linear
+  `reasoning_only` branch.
+
+Kept (non-heuristic safety nets):
+- `REASONING_ONLY_CHAR_LIMIT` / `REASONING_ONLY_RETRY_LIMIT` — plain char-count
+  timeout, not a content-quality guess.
+- `FORCED_FINAL_*` / `FINAL_ANSWER_TOOL` — the forced-final-answer rescue path.
+- `MALFORMED_STREAM_RETRY_LIMIT` / `TURN_STREAM_CUT` — truncated-JSON tool-args
+  retry.
+- `_recovery_sampling_opts` / `RECOVERY_*` — shared by malformed-stream retry
+  and `/recover`. Recovery temperature raised to `1.0` (was `0.2`); min_p,
+  repeat_penalty, and DRY params added to break repetition loops by raising
+  entropy rather than sharpening toward greedy.
+- `MANUAL_RECOVERY_NUDGE` / `/recover` command.
+
+The `model_turn` reasoning stream now just streams + counts `reasoning_only_chars`
++ cuts on the char limit; the cut handler is a single linear `reasoning_only`
+branch. Tests for the removed detectors were deleted; the remaining recovery-path
+tests (forced-final, malformed-stream, `/recover`) keep coverage of what stayed.
+README's env-var table and "Reasoning recovery guards" section updated to match
+the surviving knobs (and the new `MINION_TOOL_RESULT_CHARS` cap + DRY/repeat
+recovery params, which were previously undocumented).
+
 ### Added — `/recover` command (manual recovery checkpoint)
 New in-session command `/recover [optional note]` forces a low-temperature
 visible checkpoint via the `final_answer` tool. After a bad stream —

@@ -99,16 +99,16 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_BASE_URL` / `MINION_MODEL` / `MINION_API_KEY` | legacy single-source config (or the `local` fallback) |
 | `MINION_SOURCES` / `MINION_SOURCE_*` | named multi-source endpoints |
 | `MINION_HOME` / `MINION_SESSIONS_DIR` | where session JSON files are stored |
-| `MINION_REASONING_LOOP_SIGNALS` | threshold for the reasoning-loop guard (default 10; `0` disables) |
-| `MINION_REASONING_LOOP_RETRIES` | max escalating nudges before the reasoning-loop guard gives up and waits for user input (default 3; one per nudge in `REASONING_LOOP_NUDGES`) |
 | `MINION_MALFORMED_STREAM_RETRIES` | max clean retries for malformed/truncated tool-call args or SSE streams before waiting for user input (default 2) |
-| `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 12000; `0` disables) |
+| `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 36000; `0` disables) |
 | `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
-| `MINION_REASONING_GIBBERISH_CHARS` | rolling reasoning window for numeric/markup noise detection (default 600; `0` disables) |
-| `MINION_REASONING_GIBBERISH_RETRIES` | low-temp recovery attempts after reasoning noise is detected before forcing a visible checkpoint (default 1) |
-| `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | sampler params used only for malformed/gibberish recovery retries (defaults `0.2` / `0.95`; negative values omit them) |
+| `MINION_TOOL_RESULT_CHARS` | per-tool-result char cap before it enters message history, to starve context-copying repetition (default 20000; `0` disables the cap, dedup still runs) |
+| `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | standard sampler params used only for recovery retries (defaults `1.0` / `0.95`; negative values omit them) |
+| `MINION_RECOVERY_MIN_P` | min-p floor for recovery retries (llama.cpp extension via `extra_body`; default `0.02`; negative omits it) |
+| `MINION_RECOVERY_REPEAT_PENALTY` / `MINION_RECOVERY_REPEAT_LAST_N` | repeat penalty applied during recovery retries to lower a looping token's logit (defaults `1.2` / `512`; negative omits them) |
+| `MINION_RECOVERY_DRY_MULTIPLIER` / `MINION_RECOVERY_DRY_BASE` / `MINION_RECOVERY_DRY_ALLOWED_LENGTH` | DRY (Don't Repeat Yourself) anti-repetition params for recovery retries (defaults `0.8` / `1.75` / `2`; set `MINION_RECOVERY_DRY_MULTIPLIER` to `0` to disable DRY) |
 | `MINION_FORCED_FINAL_MAX_TOKENS` | token cap for the forced-final-answer rescue request (default 2048) |
-| `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 8192; `0` omits the cap) |
+| `MINION_MAX_TOKENS` | token cap for normal streaming requests (default 16000; `0` omits the cap) |
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
 | `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
 | `MINION_SESSION_DESC_REFRESH` | refresh the model-generated session description every N turns (default 6; `0` disables) |
@@ -136,6 +136,8 @@ so per-user settings live in one place instead of being exported every shell.
 | `/compact`          | alias for `/compress`                                    |
 | `/recover [note]`   | force a low-temp visible checkpoint after a bad stream   |
 | `/reset`            | clear conversation, start a fresh session               |
+| `/clear`            | alias for `/reset`                                       |
+| `/new`              | alias for `/reset`                                       |
 | `/quit`             | exit                                                     |
 
 ## Input
@@ -258,26 +260,57 @@ gateway.
 
 ## Reasoning recovery guards
 
-Reasoning models sometimes spin in place — they keep saying "let me implement…"
-without actually doing anything. minion counts those "ready to act" phrases
-during the reasoning phase and, after `MINION_REASONING_LOOP_SIGNALS` (default
-**10**) of them, cuts the stream and nudges the model to take a concrete action.
-Set the env var to `0` to disable, or lower it (e.g. `5`) for a more aggressive
-cut.
+Reasoning models sometimes stream a long `reasoning_content` block and then stop
+without ever emitting visible content or a tool call — a silent, empty turn that
+burns tokens for nothing. minion counts reasoning-only chars, and once the stream
+reaches `MINION_REASONING_ONLY_CHARS` (default **36000**) with no content or tool
+call in sight, it cuts the stream and nudges the model to produce a visible answer
+via the `final_answer` tool (`FORCE_FINAL_NUDGE`). After
+`MINION_REASONING_ONLY_RETRIES` (default **1**) forced-final attempts also stall,
+minion gives up and returns to the chat input for guidance. Set the char limit to
+`0` to disable the cutoff. This is a plain char-count timeout — it makes no guess
+about the *content* of the reasoning, only how much of it there is.
 
-minion also watches reasoning-only output for dense numeric/markup noise before
-any visible answer or tool call exists. If that trips, the partial assistant turn
-is discarded and the next retry uses recovery sampler params
-(`MINION_RECOVERY_TEMPERATURE=0.2`, `MINION_RECOVERY_TOP_P=0.95` by default).
-If the recovery retry also collapses into reasoning noise, minion stops trying to
-continue hidden reasoning and forces a bounded visible checkpoint via the
-`final_answer` tool. Normal turns do not pass sampler params, so llama.cpp or the
-active API keeps its own defaults unless a recovery path is in progress.
+The same forced-final rescue path handles the no-signal case too: if a turn ends
+with reasoning but zero content and zero tool calls (and wasn't already cut), the
+char-count guard trips as if the limit had been hit, so a model that thinks in
+silence still gets one visible-answer nudge instead of a dead turn.
+
+A separate guard catches malformed or truncated tool-call args and SSE streams:
+after `MINION_MALFORMED_STREAM_RETRIES` (default **2**) clean retries, minion
+stops retrying and waits for input. Each retry re-opens the stream with recovery
+sampler params — more entropy and anti-repetition than a normal turn — to escape
+the low-entropy attractor that produced the corruption.
+
+### Recovery samplers
+
+Recovery retries (malformed-stream, reasoning-only-stall rescue, and `/recover`)
+swap in a higher-entropy, anti-repetition sampler so the model doesn't collapse
+back into the same broken output:
+
+| knob | default | notes |
+| --- | --- | --- |
+| `MINION_RECOVERY_TEMPERATURE` | `1.0` | raised (not lowered) so a repetition collapse gets *more* entropy, not a sharper greedy pass |
+| `MINION_RECOVERY_TOP_P` | `0.95` | |
+| `MINION_RECOVERY_MIN_P` | `0.02` | llama.cpp extension, rides in `extra_body`; negative omits it |
+| `MINION_RECOVERY_REPEAT_PENALTY` | `1.2` | lowers a looping token's logit |
+| `MINION_RECOVERY_REPEAT_LAST_N` | `512` | window for the repeat penalty |
+| `MINION_RECOVERY_DRY_MULTIPLIER` | `0.8` | DRY anti-repetition; set to `0` to disable |
+| `MINION_RECOVERY_DRY_BASE` | `1.75` | |
+| `MINION_RECOVERY_DRY_ALLOWED_LENGTH` | `2` | |
+
+Path/code punctuation (`\n`, `:`, `"`, `*`, `/`, `\`, `` ` ``, `'`) are DRY
+sequence breakers, so a long file path the model must emit verbatim is never
+penalized as repetition. Normal turns pass no sampler params, so the server keeps
+its own defaults unless a recovery path is in progress. Non-llama.cpp backends
+ignore the unknown `extra_body` keys.
+
+### Manual recovery
 
 You can trigger the same checkpoint path manually with `/recover [optional note]`
 after interrupting a bad stream or once the prompt returns. The command appends a
-manual recovery note to the conversation and immediately forces a low-temperature
-`final_answer` checkpoint instead of letting the model continue free-form.
+manual recovery note to the conversation and immediately forces a `final_answer`
+checkpoint with recovery sampling, instead of letting the model continue free-form.
 
 ## Tools
 
