@@ -2,13 +2,49 @@
 
 ![minion](minion.png)
 
-A single-file, single-dependency terminal coding agent. One Python file, one
-`pip install openai`, no framework, no bloat. Point it at any
-OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang server, or a
+A no-nonsense coding agent that doesn't use 50K tokens of context to say "hello."
+
+Minion is a purpose built coding agent aimed at removing and keeping out context bloat. Many agent frameworks use 20K-50K+ tokens when you've just said "hey." This is caused by having a lot of features and tools that need to be loaded into the context of the LLM.
+
+This presents real challenges to running coding agents on local models, where you're often hosting the best AI you can, and you don't have much room for context. 
+
+Why do we care about this context?
+1. That first 50K of context is your fastest context for your model. We want that speed.
+2. That first 50K of context is where your model's attention mechanism is likely the best. We want that intelligence.
+3. That first 50K of context riding along every singe message you send adds to cost over time, even if you're on some API.
+
+On a bare `hey`, the entire prompt minion sends is about 625 tokens:
+
+```
+  system prompt (SYSTEM)               ~98
+  tool schemas (5 functions, TOOLS)   ~475
+  the word "hey"                         1
+  chat-template framing                ~50
+                                     ─────
+                                     ~625 tokens
+```
+
+The variance is in the last line: every server's chat template wraps
+the tool section differently (Qwen/Hermes add per-tool tags, llama.cpp
+adds a functions header, OpenAI injects its own), so the real total
+lands somewhere in the low 600s. The point is the floor — not the
+exact figure. That's two orders of magnitude less than the harnesses
+that spend the first 20K–50K of your context before you've said
+anything, and it's paid on every single turn.
+
+You don't have to take our word for it. Point any harness at a local
+server and say `hey`. Most print a token footer; minion does. The
+number you see is the number that rides along every message you send,
+and it's the cheapest thing to compare.
+
+Nothing against the more feature-rich agents, we need those too. But
+we also need a very lightweight coding agent, and here it is.
+
+Point it at any OpenAI-compatible endpoint — a local llama.cpp / vLLM / SGLang server, or a
 remote API like Z.ai or OpenAI itself — and start chatting with an agent that
 can read, write, edit, and run shell commands in your project.
 
-The whole thing is one file (`minion.py`, ~3150 lines). No TUI framework, no
+The whole thing is one file (`minion.py`, ~3200 lines). No TUI framework, no
 plugin system, no config file format. It reads from environment variables (and
 `~/.env`), talks directly to the OpenAI SDK, and uses raw terminal escapes for
 its interface. If you want to understand or modify how it works, you read one
