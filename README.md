@@ -112,6 +112,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_RISK_RETRIES` | connection retries for the command-risk classifier before prompting as high-risk (default 3) |
 | `MINION_RISK_RETRY_SECONDS` | seconds to wait between command-risk classifier connection retries (default 1) |
 | `MINION_SESSION_DESC_REFRESH` | refresh the model-generated session description every N turns (default 6; `0` disables) |
+| `MINION_METRICS_URL` | optional endpoint to receive cumulative token-usage totals after each turn (default unset; see Metrics) |
 
 ## Subcommands
 
@@ -339,6 +340,63 @@ buffer, so the chat became unscrollable in a plain terminal.)
 
 Every request and streamed SSE chunk is appended to `llamacpp.log` next to the
 script (JSONL). Useful for debugging what the model actually saw and returned.
+
+## Metrics
+
+minion records token usage for every model call (input, output, cache-read,
+and reasoning tokens) and writes it into the session JSON under
+`~/.minion/sessions/`. This is always on — the numbers are already in hand
+from the stats footer, so persisting them costs nothing and a local usage log
+is useful whether or not you point it anywhere. A saved session carries:
+
+```json
+"input_tokens": 900,
+"output_tokens": 230,
+"cache_read_tokens": 600,
+"reasoning_tokens": 120,
+"api_calls": 2,
+"started_at": 1700000000.0
+```
+
+The accounting matches the OpenAI usage convention (and what most dashboards
+expect): `input_tokens` **excludes** cached prompt tokens (those are broken out
+into `cache_read_tokens`), and `output_tokens` **excludes** reasoning tokens
+(those are broken out into `reasoning_tokens`). Local llama.cpp servers report
+via a `timings` object instead of streaming `usage`; both are normalized to the
+same four fields. Totals accumulate across a session and are reloaded on
+`--resume` / `/resume`, so they keep climbing across restarts rather than
+resetting.
+
+Optionally, set `MINION_METRICS_URL` to a POST endpoint and minion will also
+push the same cumulative totals after each turn:
+
+```
+MINION_METRICS_URL=http://localhost:9121/api/tokens/push
+```
+
+The body is a small, dashboard-agnostic JSON blob:
+
+```json
+{
+  "session_id": "20240101-120000-abcdef",
+  "model": "glm-4.6",
+  "source": "zai",
+  "input_tokens": 900,
+  "output_tokens": 230,
+  "cache_read_tokens": 600,
+  "reasoning_tokens": 120,
+  "api_calls": 2,
+  "started_at": 1700000000.0,
+  "ended_at": 1700000123.0
+}
+```
+
+Totals are cumulative per session, so the endpoint can compute its own deltas
+between pushes. The push is fire-and-forget with a 1.5 s timeout and disables
+itself after the first failure — if the endpoint is down or absent, minion
+stops trying rather than adding latency to every turn. Unset the variable (the
+default) and nothing leaves the machine; only the local session-JSON totals
+remain.
 
 ## Built with
 

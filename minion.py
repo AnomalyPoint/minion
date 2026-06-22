@@ -52,6 +52,8 @@ import sys
 import termios
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import httpx
 from openai import OpenAI, APIConnectionError, APIError
@@ -193,15 +195,15 @@ def _write_session(session_id, messages, meta=None):
             existing = {}
     except (OSError, IOError, json.JSONDecodeError):
         pass
-    data = {
-        "id": session_id,
-        "messages": messages,
-        "created_at": existing.get("created_at", now),
-        "updated_at": now,
-    }
-    for k in ("title", "source", "cwd", "model"):
-        if k in existing:
-            data[k] = existing[k]
+    # Start from the existing metadata so partial writes (e.g. the session
+    # description refresh, which only passes {"description", "desc_turns"})
+    # don't clobber fields a prior _save_current wrote — token totals,
+    # started_at, etc.  Then let `meta` override on top.
+    data = dict(existing)
+    data["id"] = session_id
+    data["messages"] = messages
+    data["created_at"] = existing.get("created_at", now)
+    data["updated_at"] = now
     if meta:
         for k, v in meta.items():
             if v is not None:
@@ -1026,6 +1028,161 @@ def _env_float(name, default):
         return float(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+# --- usage metrics (default off) --------------------------------------------
+# minion already captures every model call's token usage (the streaming
+# `usage` object from OpenAI/Z.ai, plus llama.cpp's `timings`) to print the
+# stats footer — and then throws it away. This module retains those numbers
+# so they can be written into the session JSON (always — it's free, the data
+# is already in hand) and optionally pushed to an external metrics endpoint
+# (only when MINION_METRICS_URL is set). The endpoint is generic: minion
+# posts a small JSON blob of cumulative session totals after each turn. One
+# such consumer is a personal dashboard; the format is dashboard-agnostic.
+#
+# Accounting matches the OpenAI usage convention (and Hermes's canonical
+# usage): `input_tokens` EXCLUDES cached tokens (cache is broken out into
+# `cache_read_tokens`), and `output_tokens` EXCLUDES reasoning tokens
+# (reasoning is broken out into `reasoning_tokens`). Dashboards that want a
+# "total in" sum input + cache_read; a "total out" sum output + reasoning.
+
+def _normalize_usage(usage, timings):
+    """Pull a {input, output, cache_read, reasoning} token dict out of a
+    finished model call, from whichever the server gave us: the standard
+    streaming `usage` object (OpenAI/Z.ai) or the llama.cpp `timings` extra
+    (where `usage` is null). Returns None if neither has anything to say.
+
+    Numbers are the per-call totals reported by the server, not deltas —
+    callers accumulate them. The split is:
+
+      input_tokens        prompt tokens, MINUS cached (matches OpenAI's
+                          prompt_tokens minus prompt_tokens_details.cached)
+      cache_read_tokens   cached prompt tokens (prompt_tokens_details.cached
+                          on OpenAI; cache_n on llama.cpp)
+      output_tokens       completion tokens, MINUS reasoning
+      reasoning_tokens    completion_tokens_details.reasoning_tokens, if any
+                          (reasoning models: MiniMax-M3, DeepSeek-R1, …)
+    """
+    # llama.cpp: no `usage`, but a `timings` object on the final chunk with
+    # prompt_n / predicted_n / cache_n. There's no reasoning split here —
+    # predicted_n is all generated tokens.
+    if (not usage) and timings and timings.get("predicted_n"):
+        prompt_n = int(timings.get("prompt_n") or 0)
+        cache_n = int(timings.get("cache_n") or 0)
+        gen_n = int(timings.get("predicted_n") or 0)
+        return {
+            "input_tokens": max(0, prompt_n - cache_n),
+            "output_tokens": gen_n,
+            "cache_read_tokens": cache_n,
+            "reasoning_tokens": 0,
+        }
+    if not usage:
+        return None
+    prompt_total = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_total = int(getattr(usage, "completion_tokens", 0) or 0)
+    # OpenAI/Z.ai: prompt_tokens_details.cached_tokens is the cache portion.
+    ptd = getattr(usage, "prompt_tokens_details", None)
+    cache_n = int(getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0
+    # Reasoning models break completion into content + reasoning.
+    otd = getattr(usage, "output_tokens_details", None)
+    reasoning_n = int(getattr(otd, "reasoning_tokens", 0) or 0) if otd else 0
+    return {
+        "input_tokens": max(0, prompt_total - cache_n),
+        "output_tokens": max(0, completion_total - reasoning_n),
+        "cache_read_tokens": cache_n,
+        "reasoning_tokens": reasoning_n,
+    }
+
+
+class _Metrics:
+    """Cumulative token usage for the current session, plus an optional push.
+
+    A single module-global instance, `_METRICS`, is created in main() when a
+    session starts (and recreated on /reset, reloaded on /resume). When
+    MINION_METRICS_URL is unset it's just an in-memory accumulator that feeds
+    the session-JSON totals — no network, no threads, no dependency. When the
+    URL is set, each flush() also fires off a fire-and-forget POST so a live
+    dashboard can plot tok/min. The push is best-effort: it disables itself
+    after the first failure so a missing dashboard never slows the REPL.
+    """
+
+    def __init__(self, session_id, model=None, source=None, started_at=None,
+                 push_url=None):
+        self.session_id = session_id
+        self.model = model
+        self.source = source
+        self.started_at = started_at or time.time()
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.reasoning_tokens = 0
+        self.api_calls = 0
+        self.push_url = push_url
+        self._push_disabled = False   # latched off after the first failure
+
+    def add(self, delta):
+        """Accumulate a per-call usage dict from _normalize_usage()."""
+        if not delta:
+            return
+        self.input_tokens += int(delta.get("input_tokens") or 0)
+        self.output_tokens += int(delta.get("output_tokens") or 0)
+        self.cache_read_tokens += int(delta.get("cache_read_tokens") or 0)
+        self.reasoning_tokens += int(delta.get("reasoning_tokens") or 0)
+        self.api_calls += 1
+
+    def as_meta(self):
+        """The fields merged into the session JSON on save."""
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "api_calls": self.api_calls,
+            "started_at": self.started_at,
+        }
+
+    def flush(self):
+        """Fire the optional HTTP push. Cumulative totals, so the endpoint
+        can compute its own deltas (agentdash's /api/tokens/push does)."""
+        if not self.push_url or self._push_disabled:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "model": self.model,
+            "source": self.source,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "api_calls": self.api_calls,
+            "started_at": self.started_at,
+            "ended_at": time.time(),
+        }
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                self.push_url, data=data,
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=1.5)
+        except Exception:
+            # Dashboard down / wrong port / not running — stop trying so we
+            # never add latency to the REPL on every turn.
+            self._push_disabled = True
+
+
+# Module-global recorder. None until main() builds one for the session.
+# It's threaded down into the model-turn path so each API call's usage is
+# accumulated; the REPL merges its .as_meta() into the session JSON on save.
+_METRICS = None
+
+
+def _env_metrics_url():
+    """MINION_METRICS_URL — optional endpoint to receive cumulative token
+    totals after each turn. Default unset (metrics stay local to the session
+    JSON, nothing leaves the machine). No scheme/host validation beyond
+    "looks like a URL" — a bad value just latches the push off on first try."""
+    url = os.environ.get("MINION_METRICS_URL", "").strip()
+    return url or None
 
 
 def _abbr(n):
@@ -1927,6 +2084,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     # fall back to wall-clock only. TTFT (time to first token) is shown when
     # available — for local it comes from llama.cpp timings, for remote we
     # measure it client-side.
+    if _METRICS is not None:
+        _METRICS.add(_normalize_usage(usage, timings))
     if timings and timings.get("predicted_n"):
         prompt_n = timings.get("prompt_n", 0)
         cache_n = timings.get("cache_n", 0)
@@ -2457,6 +2616,28 @@ def main():
             print(f"{YELLOW}  ✗ no saved session found for {session_id!r}; "
                   f"starting fresh{RESET}")
 
+    # --- usage metrics -------------------------------------------------------
+    # Build the cumulative-token recorder for this session. When resuming, we
+    # reload its running totals from the saved session JSON so they keep
+    # climbing across restarts instead of resetting to zero. The optional
+    # HTTP push (MINION_METRICS_URL) is off by default — see _Metrics.
+    global _METRICS
+    push_url = _env_metrics_url()
+    _METRICS = _Metrics(
+        session_id, model=MODEL,
+        source=ACTIVE.name if ACTIVE else None,
+        push_url=push_url)
+    if _resume_requested or any(a == "--session" for a in sys.argv[1:]):
+        saved = _load_session(session_id) or {}
+        if isinstance(saved.get("input_tokens"), int):
+            _METRICS.input_tokens = saved.get("input_tokens") or 0
+            _METRICS.output_tokens = saved.get("output_tokens") or 0
+            _METRICS.cache_read_tokens = saved.get("cache_read_tokens") or 0
+            _METRICS.reasoning_tokens = saved.get("reasoning_tokens") or 0
+            _METRICS.api_calls = saved.get("api_calls") or 0
+            if saved.get("started_at"):
+                _METRICS.started_at = saved["started_at"]
+
     def _save_current(meta=None):
         """Persist the in-memory `messages` to the current session file.
 
@@ -2479,10 +2660,22 @@ def main():
         m.setdefault("source", ACTIVE.name if ACTIVE else None)
         m.setdefault("cwd", os.getcwd())
         m.setdefault("model", MODEL)
+        # Merge cumulative token totals into the session JSON so they persist
+        # across restarts and are available to any metrics consumer that reads
+        # the session files (e.g. a dashboard). This is always-on — the numbers
+        # are already in hand from the stats footer, so storing them costs
+        # nothing and a local session log is useful regardless of a push sink.
+        if _METRICS is not None:
+            m.update(_METRICS.as_meta())
         try:
             _write_session(session_id, messages, m)
         except OSError as e:
             print(f"{RED}  ✗ couldn't save session: {type(e).__name__}: {e}{RESET}")
+        # Fire-and-forget push to the optional metrics endpoint. Only does
+        # anything if MINION_METRICS_URL is set; self-disables on first
+        # failure so a down/absent dashboard never slows the REPL.
+        if _METRICS is not None:
+            _METRICS.flush()
 
     while True:
         try:
@@ -2529,6 +2722,9 @@ def main():
                 print(f"{BOLD}{YELLOW}  → switched to {target}{RESET} {DIM}({MODEL} @ {src.base_url}){RESET}")
                 print(_banner())
                 session_dirty = True  # source change is worth persisting
+                if _METRICS is not None:
+                    _METRICS.model = MODEL
+                    _METRICS.source = target
             continue
         if user == "/yolo":
             YOLO = not YOLO
@@ -2566,6 +2762,11 @@ def main():
             # over the old one (mirrors Hermes's "new session on /new").
             session_id = _new_session_id()
             session_dirty = False
+            # Fresh recorder for the fresh session.
+            _METRICS = _Metrics(
+                session_id, model=MODEL,
+                source=ACTIVE.name if ACTIVE else None,
+                push_url=_env_metrics_url())
             print(f"{DIM}  new session {session_id}{RESET}")
             continue
         if user == "/recover" or user.startswith("/recover "):
@@ -2615,6 +2816,21 @@ def main():
                 session_id = new_sid
                 messages[:] = _session_messages(session_id)
                 session_dirty = False
+                # Reload the cumulative-token recorder from the resumed
+                # session's saved totals so they keep climbing from here.
+                _METRICS = _Metrics(
+                    session_id, model=MODEL,
+                    source=ACTIVE.name if ACTIVE else None,
+                    push_url=_env_metrics_url())
+                saved = _load_session(session_id) or {}
+                if isinstance(saved.get("input_tokens"), int):
+                    _METRICS.input_tokens = saved.get("input_tokens") or 0
+                    _METRICS.output_tokens = saved.get("output_tokens") or 0
+                    _METRICS.cache_read_tokens = saved.get("cache_read_tokens") or 0
+                    _METRICS.reasoning_tokens = saved.get("reasoning_tokens") or 0
+                    _METRICS.api_calls = saved.get("api_calls") or 0
+                    if saved.get("started_at"):
+                        _METRICS.started_at = saved["started_at"]
             continue
         if user == "/save" or user.startswith("/save "):
             title = user.split(None, 1)[1].strip() if " " in user else None
